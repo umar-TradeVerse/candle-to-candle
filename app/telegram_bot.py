@@ -19,21 +19,32 @@ logger = logging.getLogger("telegram_bot")
 
 class TelegramBot:
     def __init__(self, status_fn: Callable[[], Awaitable[str]],
-                 close_fn: Callable[[str], Awaitable[str]]):
+                 close_fn: Callable[[str], Awaitable[str]],
+                 health_fn: Callable[[], Awaitable[str]] = None):
         """
         status_fn: async callable -> returns a status string to send back
         close_fn: async callable(symbol: "BTC"|"GOLD"|"all") -> returns a result string
+        health_fn: async callable -> returns bot health/uptime string
         """
         self.status_fn = status_fn
         self.close_fn = close_fn
+        self.health_fn = health_fn
         self.app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         self.app.add_handler(CommandHandler("status", self._handle_status))
         self.app.add_handler(CommandHandler("close", self._handle_close))
         self.app.add_handler(CommandHandler("start", self._handle_start))
+        self.app.add_handler(CommandHandler("health", self._handle_health))
+
+    async def _handle_health(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if self.health_fn:
+            text = await self.health_fn()
+        else:
+            text = "Health check not wired up."
+        await update.message.reply_text(text)
 
     async def _handle_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "Candle-to-Candle bot online.\nCommands:\n/status\n/close BTC|GOLD|all"
+            "Candle-to-Candle bot online.\nCommands:\n/status\n/close BTC|GOLD|all\n/health"
         )
 
     async def _handle_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
