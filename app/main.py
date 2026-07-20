@@ -18,6 +18,7 @@ from app.config import (
     ANCHOR_CANDLE_HOUR_IST, ANCHOR_CANDLE_MINUTE_IST,
     FRIDAY_FORCE_CLOSE_HOUR_IST, FRIDAY_FORCE_CLOSE_MINUTE_IST,
     POLL_INTERVAL_SECONDS, CANDLE_INTERVAL,
+    HEARTBEAT_HOUR_IST, HEARTBEAT_MINUTE_IST,
     COINDCX_API_KEY, COINDCX_API_SECRET,
 )
 from app.coindcx_client import CoinDCXClient, SYMBOL_MAP
@@ -29,6 +30,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger("main")
 
 client = CoinDCXClient(COINDCX_API_KEY, COINDCX_API_SECRET)
+
+# Simple in-memory health tracking, exposed via /health and the daily heartbeat.
+# (Deliberately NOT persisted — if the process restarts, "bot_start_time" resetting
+# to "now" is itself useful information, not something to hide.)
+_health = {
+    "bot_start_time": None,
+    "last_poll_at": None,
+    "last_poll_ok": None,
+    "heartbeat_sent_date": None,
+}
 
 
 def to_candle(d) -> Candle:
@@ -86,8 +97,13 @@ class SymbolWorker:
             await self.bot.send_alert(f"[{self.name}] Position closed on exchange (stop hit). No re-entry today.")
         return sym_state
 
-    def find_anchor_candle(self, candles, now):
-        for c in candles:
+    def find_anchor_candle(self, closed_candles, now):
+        """
+        closed_candles must exclude the still-forming candle — the anchor range is only
+        valid once the 01:30 IST candle has FULLY closed (i.e. at 05:30), never from a
+        partial/in-progress version of it.
+        """
+        for c in closed_candles:
             c_time = datetime.fromtimestamp(c.open_time / 1000, tz=IST)
             if (c_time.hour == ANCHOR_CANDLE_HOUR_IST and c_time.minute == ANCHOR_CANDLE_MINUTE_IST
                     and c_time.date() == now.date()):
@@ -119,7 +135,7 @@ class SymbolWorker:
         last_closed = candles[-2]  # last item is the still-forming candle
 
         if sym_state.get("date_str") != today_str:
-            anchor = self.find_anchor_candle(candles, now)
+            anchor = self.find_anchor_candle(candles[:-1], now)  # exclude still-forming candle
             if anchor is not None:
                 sym_state["date_str"] = today_str
                 sym_state["anchor_high"] = anchor.high
@@ -225,23 +241,49 @@ async def main():
             return "\n".join([await w.manual_close() for w in workers.values()])
         return await workers[target].manual_close()
 
-    bot = TelegramBot(status_fn, close_fn)
+    async def health_fn():
+        now = datetime.now(IST)
+        started = _health["bot_start_time"]
+        last_poll = _health["last_poll_at"]
+        uptime_min = int((now - started).total_seconds() / 60) if started else 0
+        since_poll_sec = int((now - last_poll).total_seconds()) if last_poll else None
+        poll_status = "OK" if _health["last_poll_ok"] else "FAILED (check logs)"
+        lines = [
+            f"Started: {started.strftime('%Y-%m-%d %H:%M IST') if started else 'unknown'} (up {uptime_min} min)",
+            f"Last poll: {since_poll_sec}s ago — {poll_status}" if since_poll_sec is not None else "No poll completed yet",
+        ]
+        return "\n".join(lines)
+
+    bot = TelegramBot(status_fn, close_fn, health_fn)
     for name in SYMBOL_MAP.keys():
         workers[name] = SymbolWorker(name, bot)
 
     await bot.start_polling()
     for w in workers.values():
         await w.reconcile()
+    _health["bot_start_time"] = datetime.now(IST)
     await bot.send_alert("Candle-to-Candle bot started.")
 
     try:
         while True:
             now = datetime.now(IST)
+            poll_ok = True
             for w in workers.values():
                 try:
                     await w.run_once(now)
                 except Exception:
                     logger.exception(f"[{w.name}] run_once failed")
+                    poll_ok = False
+            _health["last_poll_at"] = now
+            _health["last_poll_ok"] = poll_ok
+
+            # Once-a-day heartbeat so a silent overnight crash doesn't go unnoticed.
+            if (now.hour, now.minute) >= (HEARTBEAT_HOUR_IST, HEARTBEAT_MINUTE_IST) \
+                    and _health["heartbeat_sent_date"] != now.date():
+                text = await health_fn()
+                await bot.send_alert(f"Daily heartbeat:\n{text}")
+                _health["heartbeat_sent_date"] = now.date()
+
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
     finally:
         await client.close()
