@@ -51,3 +51,9 @@ STATE_FILE = os.path.join(STATE_DIR, "candle_to_candle_state.json")
 # ---------- Polling ----------
 # How often the scheduler wakes up to check "has a new candle closed" / "did price break the range".
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "30"))
+
+# ---------- Heartbeat ----------
+# A once-a-day "I'm alive" alert so a silent crash overnight doesn't go unnoticed —
+# you don't have to remember to check /status yourself.
+HEARTBEAT_HOUR_IST = int(os.environ.get("HEARTBEAT_HOUR_IST", "8"))
+HEARTBEAT_MINUTE_IST = int(os.environ.get("HEARTBEAT_MINUTE_IST", "0"))
