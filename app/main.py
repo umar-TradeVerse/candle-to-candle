@@ -19,7 +19,7 @@ from app.config import (
     FRIDAY_FORCE_CLOSE_HOUR_IST, FRIDAY_FORCE_CLOSE_MINUTE_IST,
     POLL_INTERVAL_SECONDS, CANDLE_INTERVAL,
     HEARTBEAT_HOUR_IST, HEARTBEAT_MINUTE_IST,
-    ENTRY_RETRY_BACKOFF_SECONDS,
+    ENTRY_RETRY_BACKOFF_SECONDS, MAX_ENTRY_RETRIES,
     COINDCX_API_KEY, COINDCX_API_SECRET,
 )
 from app.coindcx_client import CoinDCXClient, SYMBOL_MAP
@@ -143,6 +143,8 @@ class SymbolWorker:
                 sym_state["anchor_low"] = anchor.low
                 sym_state["traded_today"] = False
                 sym_state["stopped_out_today"] = False
+                sym_state["entry_attempt_count"] = 0
+                sym_state["entry_abandoned_alert_sent"] = False
                 await self.bot.send_alert(f"[{self.name}] New day range set: H={anchor.high} L={anchor.low}")
 
         ctx = DayContext(
@@ -154,6 +156,29 @@ class SymbolWorker:
             position_side=sym_state.get("position_side"),
             current_sl=sym_state.get("current_sl"),
         )
+
+        # Urgent, candle-independent check: a position with no SL is a live risk and
+        # can't wait for the next "new candle" cycle to fix it. This runs EVERY poll
+        # (every ~30s), deliberately placed before the same-candle early-return below.
+        if ctx.position_side and ctx.current_sl is None:
+            target_sl = sym_state.get("pending_sl")
+            if target_sl:
+                ok = await client.update_stop_loss(self.name, target_sl)
+                if ok:
+                    sym_state["current_sl"] = target_sl
+                    await self.bot.send_alert(f"[{self.name}] SL now attached: {target_sl:.2f} (was previously missing)")
+                else:
+                    last_protect_alert = sym_state.get("last_sl_protect_alert_at")
+                    seconds_since = (now.timestamp() - last_protect_alert) if last_protect_alert else None
+                    if seconds_since is None or seconds_since >= ENTRY_RETRY_BACKOFF_SECONDS:
+                        sym_state["last_sl_protect_alert_at"] = now.timestamp()
+                        await self.bot.send_alert(
+                            f"🚨 [{self.name}] STILL UNPROTECTED — SL attach retrying every poll cycle, "
+                            f"consider setting one manually on CoinDCX or /close {self.name}"
+                        )
+            state = set_symbol_state(state, self.name, sym_state)
+            save_state(state)
+            return
 
         if last_closed.open_time == self.last_seen_candle_open:
             state = set_symbol_state(state, self.name, sym_state)
@@ -179,17 +204,35 @@ class SymbolWorker:
         elif not ctx.traded_today and not ctx.stopped_out_today and ctx.anchor_high:
             direction = check_breakout(ctx, last_closed)
             if direction:
-                last_attempt = sym_state.get("last_entry_attempt_at")
-                seconds_since_attempt = (now.timestamp() - last_attempt) if last_attempt else None
-                if seconds_since_attempt is not None and seconds_since_attempt < ENTRY_RETRY_BACKOFF_SECONDS:
-                    pass  # too soon since last failed attempt — stay quiet, retry later
+                attempt_count = sym_state.get("entry_attempt_count", 0)
+                if attempt_count >= MAX_ENTRY_RETRIES:
+                    # Give up quietly for today — some failures (e.g. an exchange marking
+                    # an instrument inactive) won't resolve minute-to-minute, and retrying
+                    # forever just spams alerts and hammers the API for no benefit.
+                    if not sym_state.get("entry_abandoned_alert_sent"):
+                        await self.bot.send_alert(
+                            f"[{self.name}] Giving up on today's entry after {attempt_count} failed "
+                            f"attempts — will try again with tomorrow's new range. Check the underlying "
+                            f"issue manually if this keeps happening."
+                        )
+                        sym_state["entry_abandoned_alert_sent"] = True
+                    sym_state["stopped_out_today"] = True  # blocks further attempts today
+                    self.last_seen_candle_open = last_closed.open_time
                 else:
-                    sym_state["last_entry_attempt_at"] = now.timestamp()
-                    entered = await self.enter(ctx, direction, last_closed, sym_state)
-                    if entered:
-                        self.last_seen_candle_open = last_closed.open_time
-                    # else: deliberately NOT advancing — retry this breakout after the backoff,
-                    # until either it succeeds or a new candle closes and supersedes it
+                    last_attempt = sym_state.get("last_entry_attempt_at")
+                    seconds_since_attempt = (now.timestamp() - last_attempt) if last_attempt else None
+                    if seconds_since_attempt is not None and seconds_since_attempt < ENTRY_RETRY_BACKOFF_SECONDS:
+                        pass  # too soon since last failed attempt — stay quiet, retry later
+                    else:
+                        sym_state["last_entry_attempt_at"] = now.timestamp()
+                        entered = await self.enter(ctx, direction, last_closed, sym_state)
+                        if entered:
+                            self.last_seen_candle_open = last_closed.open_time
+                        else:
+                            sym_state["entry_attempt_count"] = attempt_count + 1
+                        # else (failed): deliberately NOT advancing — retry after the backoff,
+                        # until either it succeeds, hits MAX_ENTRY_RETRIES, or a new candle
+                        # closes and supersedes it
             else:
                 self.last_seen_candle_open = last_closed.open_time  # no breakout, nothing to retry
         else:
@@ -208,15 +251,24 @@ class SymbolWorker:
         qty = self.compute_quantity(trigger_candle.close, usdt_inr_rate)
         sl_price = initial_sl(ctx, direction, trigger_candle, SL_BUFFER_PCT)
         result = await client.place_market_order(self.name, side, qty, sl_price, LEVERAGE)
+        sym_state["pending_sl"] = sl_price  # retained even on failure, so retries know the target
         if result and result.get("id"):
             sym_state["traded_today"] = True
             sym_state["position_side"] = direction
-            sym_state["current_sl"] = sl_price
-            warning_note = f"\n⚠️ {result['warning']}" if result.get("warning") else ""
-            await self.bot.send_alert(
-                f"[{self.name}] ENTERED {direction.upper()} at ~{trigger_candle.close:.2f}, "
-                f"SL={sl_price:.2f}{warning_note}"
-            )
+            if result.get("sl_attach_failed"):
+                # Position IS open on the exchange but has NO stop-loss protecting it —
+                # this is worse than a failed entry, it's a live unprotected position.
+                sym_state["current_sl"] = None
+                await self.bot.send_alert(
+                    f"🚨 [{self.name}] ENTERED {direction.upper()} at ~{trigger_candle.close:.2f} but "
+                    f"SL ATTACHMENT FAILED — position is UNPROTECTED. Check CoinDCX and set a stop "
+                    f"manually NOW, or use /close {self.name} to flatten."
+                )
+            else:
+                sym_state["current_sl"] = sl_price
+                await self.bot.send_alert(
+                    f"[{self.name}] ENTERED {direction.upper()} at ~{trigger_candle.close:.2f}, SL={sl_price:.2f}"
+                )
             return True
         else:
             err = result.get("error") if result else "no response"
