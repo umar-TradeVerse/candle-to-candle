@@ -139,27 +139,41 @@ class CoinDCXClient:
     # ---------- market data ----------
     async def get_futures_candles(self, symbol: str, interval: str = "4h",
                                    lookback_days: int = 5, limit: int = 60) -> list:
-        """Returns complete candle list (oldest first), including the still-forming
-        latest candle (same shape/endpoint pattern as TradeVerse's daily/15m candle calls)."""
+        """
+        CoinDCX's public candles endpoint does NOT support a native 4h interval —
+        confirmed live: only 1m, 15m, 1h, 1d are accepted (error BFF-SO-004 otherwise).
+        For interval="4h" we fetch 1h candles and aggregate them into synthetic 4H
+        candles ourselves, bucketed on UTC 4-hour boundaries (00, 04, 08, 12, 16, 20).
+        This lines up EXACTLY with the IST candle-open times this strategy uses —
+        01:30/05:30/09:30/13:30/17:30/21:30 IST = 20:00/00:00/04:00/08:00/12:00/16:00
+        UTC — so no approximation is involved, just correct bucketing.
+
+        Returns complete candle list (oldest first), including the still-forming
+        latest (possibly-partial) 4H candle.
+        """
         coindcx_symbol = SYMBOL_MAP.get(symbol)
         if not coindcx_symbol:
             logger.error(f"Unknown symbol: {symbol}")
             return []
 
+        fetch_interval = "1h" if interval == "4h" else interval
+        fetch_limit = limit * 4 if interval == "4h" else limit
+
         now_ist = datetime.now(IST)
         start_ts = int((now_ist - timedelta(days=lookback_days)).timestamp() * 1000)
         end_ts = int(now_ist.timestamp() * 1000)
-        params = {"pair": coindcx_symbol, "interval": interval, "from": start_ts, "to": end_ts, "limit": limit}
+        params = {"pair": coindcx_symbol, "interval": fetch_interval, "from": start_ts,
+                  "to": end_ts, "limit": fetch_limit}
 
         result = await self._get("/market_data/candles", params=params)
         if not result or not isinstance(result, list):
-            logger.error(f"{symbol} | No {interval} candle data returned")
+            logger.error(f"{symbol} | No {fetch_interval} candle data returned")
             return []
 
-        candles = []
+        raw = []
         for c in result:
             try:
-                candles.append({
+                raw.append({
                     "open_time": int(c["time"]),
                     "open": float(c["open"]),
                     "high": float(c["high"]),
@@ -168,8 +182,31 @@ class CoinDCXClient:
                 })
             except (KeyError, ValueError, TypeError):
                 continue
-        candles.sort(key=lambda c: c["open_time"])
-        return candles
+        raw.sort(key=lambda c: c["open_time"])
+
+        if interval != "4h":
+            return raw
+        return self._aggregate_to_4h(raw)
+
+    @staticmethod
+    def _aggregate_to_4h(hourly_candles: list) -> list:
+        BUCKET_MS = 4 * 3600 * 1000
+        buckets: dict = {}
+        for c in hourly_candles:
+            bucket_key = c["open_time"] // BUCKET_MS
+            buckets.setdefault(bucket_key, []).append(c)
+
+        aggregated = []
+        for bucket_key in sorted(buckets.keys()):
+            group = sorted(buckets[bucket_key], key=lambda c: c["open_time"])
+            aggregated.append({
+                "open_time": group[0]["open_time"],
+                "open": group[0]["open"],
+                "high": max(c["high"] for c in group),
+                "low": min(c["low"] for c in group),
+                "close": group[-1]["close"],
+            })
+        return aggregated
 
     # ---------- instrument details / rounding ----------
     async def _get_instrument_details(self, coindcx_symbol: str) -> Optional[dict]:
