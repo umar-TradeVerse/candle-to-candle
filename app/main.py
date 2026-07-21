@@ -19,6 +19,7 @@ from app.config import (
     FRIDAY_FORCE_CLOSE_HOUR_IST, FRIDAY_FORCE_CLOSE_MINUTE_IST,
     POLL_INTERVAL_SECONDS, CANDLE_INTERVAL,
     HEARTBEAT_HOUR_IST, HEARTBEAT_MINUTE_IST,
+    ENTRY_RETRY_BACKOFF_SECONDS,
     COINDCX_API_KEY, COINDCX_API_SECRET,
 )
 from app.coindcx_client import CoinDCXClient, SYMBOL_MAP
@@ -178,11 +179,17 @@ class SymbolWorker:
         elif not ctx.traded_today and not ctx.stopped_out_today and ctx.anchor_high:
             direction = check_breakout(ctx, last_closed)
             if direction:
-                entered = await self.enter(ctx, direction, last_closed, sym_state)
-                if entered:
-                    self.last_seen_candle_open = last_closed.open_time
-                # else: deliberately NOT advancing — retry this breakout next poll cycle,
-                # until either it succeeds or a new candle closes and supersedes it
+                last_attempt = sym_state.get("last_entry_attempt_at")
+                seconds_since_attempt = (now.timestamp() - last_attempt) if last_attempt else None
+                if seconds_since_attempt is not None and seconds_since_attempt < ENTRY_RETRY_BACKOFF_SECONDS:
+                    pass  # too soon since last failed attempt — stay quiet, retry later
+                else:
+                    sym_state["last_entry_attempt_at"] = now.timestamp()
+                    entered = await self.enter(ctx, direction, last_closed, sym_state)
+                    if entered:
+                        self.last_seen_candle_open = last_closed.open_time
+                    # else: deliberately NOT advancing — retry this breakout after the backoff,
+                    # until either it succeeds or a new candle closes and supersedes it
             else:
                 self.last_seen_candle_open = last_closed.open_time  # no breakout, nothing to retry
         else:
@@ -193,28 +200,41 @@ class SymbolWorker:
 
     async def enter(self, ctx, direction, trigger_candle, sym_state):
         side = "buy" if direction == "long" else "sell"
-        qty = self.compute_quantity(trigger_candle.close)
+        usdt_inr_rate = await client.get_usdt_inr_rate()
+        if not usdt_inr_rate or usdt_inr_rate <= 0:
+            logger.error(f"[{self.name}] could not fetch USDT/INR rate — aborting entry rather than risk mis-sizing")
+            await self.bot.send_alert(f"[{self.name}] ENTRY BLOCKED: couldn't fetch USDT/INR rate, will retry")
+            return False
+        qty = self.compute_quantity(trigger_candle.close, usdt_inr_rate)
         sl_price = initial_sl(ctx, direction, trigger_candle, SL_BUFFER_PCT)
         result = await client.place_market_order(self.name, side, qty, sl_price, LEVERAGE)
         if result and result.get("id"):
             sym_state["traded_today"] = True
             sym_state["position_side"] = direction
             sym_state["current_sl"] = sl_price
+            warning_note = f"\n⚠️ {result['warning']}" if result.get("warning") else ""
             await self.bot.send_alert(
-                f"[{self.name}] ENTERED {direction.upper()} at ~{trigger_candle.close:.2f}, SL={sl_price:.2f}"
+                f"[{self.name}] ENTERED {direction.upper()} at ~{trigger_candle.close:.2f}, "
+                f"SL={sl_price:.2f}{warning_note}"
             )
             return True
         else:
             err = result.get("error") if result else "no response"
             logger.error(f"[{self.name}] entry failed: {err}")
             await self.bot.send_alert(
-                f"[{self.name}] ENTRY FAILED ({err}) — will retry next poll cycle until this candle closes"
+                f"[{self.name}] ENTRY FAILED ({err}) — will retry in {ENTRY_RETRY_BACKOFF_SECONDS // 60} min"
             )
             return False
 
-    def compute_quantity(self, price):
-        # Rounding to the instrument's step size happens inside place_market_order.
-        return (POSITION_SIZE_INR * LEVERAGE) / price
+    def compute_quantity(self, price_usdt, usdt_inr_rate):
+        """
+        POSITION_SIZE_INR is rupees, LEVERAGE gives notional exposure, but the pair's
+        price is quoted in USDT — so INR must convert to USDT before dividing by price.
+        Rounding to the instrument's step size happens inside place_market_order.
+        """
+        notional_inr = POSITION_SIZE_INR * LEVERAGE
+        notional_usdt = notional_inr / usdt_inr_rate
+        return notional_usdt / price_usdt
 
     async def force_close(self, sym_state, reason):
         details = await client.get_position_details(self.name)
