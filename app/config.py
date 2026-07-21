@@ -63,3 +63,9 @@ HEARTBEAT_MINUTE_IST = int(os.environ.get("HEARTBEAT_MINUTE_IST", "0"))
 # every single poll cycle. This throttles retries (and the matching Telegram alert)
 # to once per this many seconds, so a non-transient failure doesn't spam every 30s.
 ENTRY_RETRY_BACKOFF_SECONDS = int(os.environ.get("ENTRY_RETRY_BACKOFF_SECONDS", "300"))
+
+# After this many failed attempts on the SAME breakout, stop retrying and go quiet
+# until the next day's fresh anchor range — some failures (e.g. an exchange marking
+# an instrument inactive) aren't going to resolve minute-to-minute, and retrying
+# forever just spams alerts and hammers the API for no benefit.
+MAX_ENTRY_RETRIES = int(os.environ.get("MAX_ENTRY_RETRIES", "3"))
