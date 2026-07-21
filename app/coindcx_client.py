@@ -290,8 +290,21 @@ class CoinDCXClient:
     # ---------- trading ----------
     async def place_market_order(self, symbol: str, side: str, quantity: float,
                                   sl_price: float, leverage: int = 5) -> Optional[dict]:
-        """Single call: enters the position AND attaches the stop-loss. No separate
-        stop order to track."""
+        """
+        Two-step: enter with a plain market order, THEN attach the stop-loss as a
+        separate call via update_stop_loss(). Originally this tried to attach
+        stop_loss_price inline on the entry order itself — but that produced
+        "Instrument is not active" for GOLD specifically while manual trades (which
+        don't attach a bracket SL) worked fine, pointing at inline-SL support being
+        the actual incompatibility, not the instrument or the margin currency.
+        Decoupling this way works regardless of whether a given instrument supports
+        bracket orders, since it never relies on that feature.
+
+        ⚠️ Because this is now two calls, there's a brief window between entry and
+        SL attachment where the position exists but has no stop loss protecting it.
+        If the SL-attach step fails, the caller MUST be told loudly — see the
+        "sl_attach_failed" flag in the returned dict.
+        """
         coindcx_symbol = SYMBOL_MAP.get(symbol)
         if not coindcx_symbol:
             logger.error(f"Unknown symbol: {symbol}")
@@ -325,7 +338,6 @@ class CoinDCXClient:
                 "order_type": "market_order",
                 "total_quantity": quantity,
                 "leverage": leverage,
-                "stop_loss_price": sl_price,
                 "notification": "email_notification",
                 "time_in_force": "good_till_cancel",
                 "hidden": False,
@@ -337,40 +349,36 @@ class CoinDCXClient:
         result = await self._post("/exchange/v1/derivatives/futures/orders/create", body)
 
         if not result and self.last_error and "not active" in self.last_error.lower():
-            # *** SELF-DIAGNOSING FALLBACK 2026-07-21 ***
-            # Working theory: some instruments (newer tokenized-commodity listings like
-            # gold) may not yet support INR-margined trading specifically, even though
-            # they render under the app's "INR Futures" tab. Retry once without forcing
-            # INR margin — if THIS succeeds, we've learned something concrete instead of
-            # guessing, and the caller is told clearly rather than this proceeding silently.
+            # Kept as a secondary fallback in case margin currency is ALSO an issue for
+            # some instrument — cheap to try, won't hurt if the real cause was inline SL.
             logger.warning(f"{symbol} | Order rejected as 'not active' with INR margin — "
                            f"retrying once without forcing margin currency")
             body["order"].pop("margin_currency_short_name", None)
             body["timestamp"] = int(time.time() * 1000)
             result = await self._post("/exchange/v1/derivatives/futures/orders/create", body)
-            if result:
-                order_obj = result[0] if isinstance(result, list) else result
-                order_id = order_obj.get("id")
-                logger.warning(f"{symbol} | Order succeeded WITHOUT forced INR margin — "
-                               f"this instrument likely doesn't support INR margin yet, "
-                               f"verify actual margin currency on CoinDCX manually")
-                return {"id": order_id, "symbol": symbol, "side": side, "quantity": quantity,
-                         "sl_price": sl_price, "leverage": leverage,
-                         "warning": "Entered WITHOUT forced INR margin — instrument may not support it"}
 
-        if result:
-            if isinstance(result, list) and not result:
-                logger.error(f"{symbol} | Empty list response from order create — verify manually")
-                return {"id": None, "error": "Empty list response — verify manually"}
-            order_obj = result[0] if isinstance(result, list) else result
-            order_id = order_obj.get("id")
-            logger.info(f"{symbol} {side} market order placed with SL @ {sl_price} "
-                        f"leverage={leverage}x: {order_id}")
+        if not result:
+            logger.error(f"{symbol} | Failed to place market order: {self.last_error}")
+            return {"id": None, "error": self.last_error or "Unknown error"}
+
+        if isinstance(result, list) and not result:
+            logger.error(f"{symbol} | Empty list response from order create — verify manually")
+            return {"id": None, "error": "Empty list response — verify manually"}
+
+        order_obj = result[0] if isinstance(result, list) else result
+        order_id = order_obj.get("id")
+        logger.info(f"{symbol} {side} market order placed (no inline SL): {order_id}")
+
+        # Brief settle time so the position is queryable before we try to attach the SL.
+        await asyncio.sleep(1.5)
+        sl_ok = await self.update_stop_loss(symbol, sl_price)
+        if sl_ok:
             return {"id": order_id, "symbol": symbol, "side": side, "quantity": quantity,
                      "sl_price": sl_price, "leverage": leverage}
 
-        logger.error(f"{symbol} | Failed to place market order with SL: {self.last_error}")
-        return {"id": None, "error": self.last_error or "Unknown error"}
+        logger.error(f"{symbol} | ENTERED but SL attachment FAILED — position is UNPROTECTED")
+        return {"id": order_id, "symbol": symbol, "side": side, "quantity": quantity,
+                 "sl_price": sl_price, "leverage": leverage, "sl_attach_failed": True}
 
     async def get_open_positions(self) -> dict:
         """Returns {internal_symbol: active_pos} for currently-open positions only."""
