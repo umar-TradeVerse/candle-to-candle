@@ -57,3 +57,9 @@ POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "30"))
 # you don't have to remember to check /status yourself.
 HEARTBEAT_HOUR_IST = int(os.environ.get("HEARTBEAT_HOUR_IST", "8"))
 HEARTBEAT_MINUTE_IST = int(os.environ.get("HEARTBEAT_MINUTE_IST", "0"))
+
+# ---------- Entry retry ----------
+# If an entry fails (insufficient funds, inactive instrument, etc.), retry — but not
+# every single poll cycle. This throttles retries (and the matching Telegram alert)
+# to once per this many seconds, so a non-transient failure doesn't spam every 30s.
+ENTRY_RETRY_BACKOFF_SECONDS = int(os.environ.get("ENTRY_RETRY_BACKOFF_SECONDS", "300"))
