@@ -158,7 +158,6 @@ class SymbolWorker:
             state = set_symbol_state(state, self.name, sym_state)
             save_state(state)
             return
-        self.last_seen_candle_open = last_closed.open_time
 
         if ctx.position_side:
             new_sl = ratchet_sl(ctx.current_sl, ctx.position_side, last_closed, SL_BUFFER_PCT)
@@ -167,12 +166,27 @@ class SymbolWorker:
                 if ok:
                     sym_state["current_sl"] = new_sl
                     await self.bot.send_alert(f"[{self.name}] SL ratcheted to {new_sl:.2f}")
+                    self.last_seen_candle_open = last_closed.open_time
                 else:
-                    await self.bot.send_alert(f"[{self.name}] WARNING: SL ratchet failed, check exchange manually")
+                    await self.bot.send_alert(
+                        f"[{self.name}] WARNING: SL ratchet failed, will retry next poll cycle"
+                    )
+                    # deliberately NOT advancing last_seen_candle_open — retry until it succeeds
+                    # or the position closes some other way (sync_position_state handles that)
+            else:
+                self.last_seen_candle_open = last_closed.open_time  # nothing to ratchet, mark handled
         elif not ctx.traded_today and not ctx.stopped_out_today and ctx.anchor_high:
             direction = check_breakout(ctx, last_closed)
             if direction:
-                await self.enter(ctx, direction, last_closed, sym_state)
+                entered = await self.enter(ctx, direction, last_closed, sym_state)
+                if entered:
+                    self.last_seen_candle_open = last_closed.open_time
+                # else: deliberately NOT advancing — retry this breakout next poll cycle,
+                # until either it succeeds or a new candle closes and supersedes it
+            else:
+                self.last_seen_candle_open = last_closed.open_time  # no breakout, nothing to retry
+        else:
+            self.last_seen_candle_open = last_closed.open_time  # nothing actionable this cycle
 
         state = set_symbol_state(state, self.name, sym_state)
         save_state(state)
@@ -189,10 +203,14 @@ class SymbolWorker:
             await self.bot.send_alert(
                 f"[{self.name}] ENTERED {direction.upper()} at ~{trigger_candle.close:.2f}, SL={sl_price:.2f}"
             )
+            return True
         else:
             err = result.get("error") if result else "no response"
             logger.error(f"[{self.name}] entry failed: {err}")
-            await self.bot.send_alert(f"[{self.name}] ENTRY FAILED ({err}) — check exchange manually")
+            await self.bot.send_alert(
+                f"[{self.name}] ENTRY FAILED ({err}) — will retry next poll cycle until this candle closes"
+            )
+            return False
 
     def compute_quantity(self, price):
         # Rounding to the instrument's step size happens inside place_market_order.
