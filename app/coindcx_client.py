@@ -34,9 +34,13 @@ COINDCX_PUBLIC_URL = "https://public.coindcx.com"
 
 # This bot only ever trades these two — kept separate from TradeVerse's SYMBOL_MAP
 # so the two bots can never accidentally collide on a symbol key.
+# *** CORRECTED 2026-07-21 *** — confirmed live: "B-XAU_USDT" does not exist
+# ("Invalid pair" error). The underlying token is XAUT (Tether Gold), matching
+# CoinDCX's spot pair "XAUTUSDT" — so the futures pair follows the same naming
+# convention as BTC. Still worth a live confirmation on first successful entry.
 SYMBOL_MAP = {
     "BTC": "B-BTC_USDT",
-    "GOLD": "B-XAU_USDT",
+    "GOLD": "B-XAUT_USDT",
 }
 REVERSE_SYMBOL_MAP = {v: k for k, v in SYMBOL_MAP.items()}
 
