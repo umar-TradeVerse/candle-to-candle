@@ -141,6 +141,39 @@ class CoinDCXClient:
             return None
 
     # ---------- market data ----------
+    async def get_usdt_inr_rate(self) -> Optional[float]:
+        """
+        *** CRITICAL FIX 2026-07-21 ***
+        Needed because compute_quantity() was treating POSITION_SIZE_INR (rupees) as
+        if it were already in USDT before dividing by a USDT-denominated price — with
+        USDT trading around ₹100+, that inflated every position by ~90-100x, which is
+        exactly what produced "Insufficient funds" on a wallet that actually had plenty
+        of INR. This fetches the real rate so sizing converts INR -> USDT correctly
+        before computing quantity.
+        """
+        session = await self._get_session()
+        url = self.base_url + "/exchange/ticker"
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    logger.error(f"GET /exchange/ticker -> {resp.status}")
+                    return None
+                data = await resp.json()
+        except Exception as e:
+            logger.error(f"GET /exchange/ticker error: {e}")
+            return None
+
+        if not isinstance(data, list):
+            return None
+        for entry in data:
+            if entry.get("market") == "USDTINR":
+                try:
+                    return float(entry["last_price"])
+                except (KeyError, ValueError, TypeError):
+                    return None
+        logger.error("USDTINR market not found in ticker response")
+        return None
+
     async def get_futures_candles(self, symbol: str, interval: str = "4h",
                                    lookback_days: int = 5, limit: int = 60) -> list:
         """
@@ -302,6 +335,29 @@ class CoinDCXClient:
         }
 
         result = await self._post("/exchange/v1/derivatives/futures/orders/create", body)
+
+        if not result and self.last_error and "not active" in self.last_error.lower():
+            # *** SELF-DIAGNOSING FALLBACK 2026-07-21 ***
+            # Working theory: some instruments (newer tokenized-commodity listings like
+            # gold) may not yet support INR-margined trading specifically, even though
+            # they render under the app's "INR Futures" tab. Retry once without forcing
+            # INR margin — if THIS succeeds, we've learned something concrete instead of
+            # guessing, and the caller is told clearly rather than this proceeding silently.
+            logger.warning(f"{symbol} | Order rejected as 'not active' with INR margin — "
+                           f"retrying once without forcing margin currency")
+            body["order"].pop("margin_currency_short_name", None)
+            body["timestamp"] = int(time.time() * 1000)
+            result = await self._post("/exchange/v1/derivatives/futures/orders/create", body)
+            if result:
+                order_obj = result[0] if isinstance(result, list) else result
+                order_id = order_obj.get("id")
+                logger.warning(f"{symbol} | Order succeeded WITHOUT forced INR margin — "
+                               f"this instrument likely doesn't support INR margin yet, "
+                               f"verify actual margin currency on CoinDCX manually")
+                return {"id": order_id, "symbol": symbol, "side": side, "quantity": quantity,
+                         "sl_price": sl_price, "leverage": leverage,
+                         "warning": "Entered WITHOUT forced INR margin — instrument may not support it"}
+
         if result:
             if isinstance(result, list) and not result:
                 logger.error(f"{symbol} | Empty list response from order create — verify manually")
