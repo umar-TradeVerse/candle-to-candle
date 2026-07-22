@@ -6,15 +6,16 @@ Built against the tested CoinDCXClient (adapted from TradeVerse's live client):
   - Ratcheting SL is ONE call: update_stop_loss(symbol, new_sl_price)
   - No separate stop-order ids to track/cancel — the position IS the SL carrier.
 
-*** FLAGGED FOR REVIEW *** (see README) — INR margin param, GOLD instrument details,
-and one supervised dry run all still need a live check before real capital.
+BTC-only as of 2026-07-22 (GOLD dropped — see README "Why GOLD was dropped").
+Sizing bug, inline-SL incompatibility, and the Telegram-token-in-logs issue have all
+since been fixed and confirmed live — see README's "Status of previously-flagged items".
 """
 import asyncio
 import logging
 from datetime import datetime
 
 from app.config import (
-    IST, TRADING_WEEKDAYS, LEVERAGE, POSITION_SIZE_INR, SL_BUFFER_PCT,
+    IST, TRADING_WEEKDAYS, TRADES_WEEKENDS, LEVERAGE, POSITION_SIZE_INR, SL_BUFFER_PCT,
     ANCHOR_CANDLE_HOUR_IST, ANCHOR_CANDLE_MINUTE_IST,
     FRIDAY_FORCE_CLOSE_HOUR_IST, FRIDAY_FORCE_CLOSE_MINUTE_IST,
     POLL_INTERVAL_SECONDS, CANDLE_INTERVAL,
@@ -28,6 +29,13 @@ from app.state_store import load_state, save_state, get_symbol_state, set_symbol
 from app.telegram_bot import TelegramBot
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+# httpx logs the full request URL at INFO level — for Telegram API calls that URL
+# embeds the bot token (https://api.telegram.org/bot<TOKEN>/method). Silencing this
+# specific logger to WARNING stops the token from ever appearing in logs, without
+# losing anything useful (our own coindcx/main loggers carry the actual signal).
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 logger = logging.getLogger("main")
 
 client = CoinDCXClient(COINDCX_API_KEY, COINDCX_API_SECRET)
@@ -52,6 +60,8 @@ def is_trading_day(dt) -> bool:
 
 
 def is_past_friday_force_close(dt) -> bool:
+    if TRADES_WEEKENDS:
+        return False  # no weekend gap to protect against if Sat/Sun are trading days
     if dt.weekday() != 4:
         return False
     cutoff = dt.replace(hour=FRIDAY_FORCE_CLOSE_HOUR_IST, minute=FRIDAY_FORCE_CLOSE_MINUTE_IST,
@@ -61,7 +71,7 @@ def is_past_friday_force_close(dt) -> bool:
 
 class SymbolWorker:
     def __init__(self, name, bot: TelegramBot):
-        self.name = name  # "BTC" or "GOLD" — matches coindcx_client.SYMBOL_MAP keys
+        self.name = name  # e.g. "BTC" — matches a key in coindcx_client.SYMBOL_MAP
         self.bot = bot
         self.last_seen_candle_open = None
 
@@ -187,6 +197,13 @@ class SymbolWorker:
 
         if ctx.position_side:
             new_sl = ratchet_sl(ctx.current_sl, ctx.position_side, last_closed, SL_BUFFER_PCT)
+            candle_extreme = last_closed.low if ctx.position_side == "long" else last_closed.high
+            logger.info(
+                f"[{self.name}] ratchet check @ candle close {last_closed.open_time}: "
+                f"side={ctx.position_side} candle_extreme={candle_extreme:.2f} "
+                f"current_sl={ctx.current_sl:.2f} candidate_sl={new_sl:.2f} "
+                f"{'WILL TIGHTEN' if new_sl != ctx.current_sl else 'no improvement, unchanged'}"
+            )
             if new_sl != ctx.current_sl:
                 ok = await client.update_stop_loss(self.name, new_sl)
                 if ok:
@@ -344,7 +361,7 @@ async def main():
         ]
         return "\n".join(lines)
 
-    bot = TelegramBot(status_fn, close_fn, health_fn)
+    bot = TelegramBot(status_fn, close_fn, valid_symbols=SYMBOL_MAP.keys(), health_fn=health_fn)
     for name in SYMBOL_MAP.keys():
         workers[name] = SymbolWorker(name, bot)
 
