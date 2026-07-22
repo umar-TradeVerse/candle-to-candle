@@ -16,8 +16,8 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]  # your chat/user id, alerts go here
 
 # ---------- Risk / sizing ----------
-LEVERAGE = 5
-POSITION_SIZE_INR = 5000  # flat per symbol for v1 (risk-normalized sizing is a fast-follow)
+LEVERAGE = 10
+POSITION_SIZE_INR = 10000  # flat per symbol for v1 (risk-normalized sizing is a fast-follow)
 
 # SL buffer: how far beyond the candle low/high the stop actually sits,
 # so a brief wick-touch doesn't stop us out. Applied at every ratchet step.
@@ -25,7 +25,10 @@ SL_BUFFER_PCT = float(os.environ.get("SL_BUFFER_PCT", "0.5"))  # percent
 
 # ---------- Calendar ----------
 IST = ZoneInfo("Asia/Kolkata")
-TRADING_WEEKDAYS = {1, 2, 3, 4}  # Python weekday(): Mon=0 ... Tue=1, Wed=2, Thu=3, Fri=4
+# Python weekday(): Mon=0, Tue=1, Wed=2, Thu=3, Fri=4, Sat=5, Sun=6
+# Full week now that GOLD (Mon-Fri only) is dropped and BTC (24/7) is the sole symbol.
+TRADING_WEEKDAYS = {0, 1, 2, 3, 4, 5, 6}
+TRADES_WEEKENDS = {5, 6}.issubset(TRADING_WEEKDAYS)
 
 CANDLE_INTERVAL = "4h"
 CANDLE_INTERVAL_MINUTES = 240
@@ -36,7 +39,8 @@ ANCHOR_CANDLE_HOUR_IST = 1
 ANCHOR_CANDLE_MINUTE_IST = 30
 
 # Force-close: flatten any open position before the weekend, no matter the P&L.
-# We flatten at the close of Friday's last 4H candle (21:30 IST candle, closing 01:30 Sat).
+# Only applies if TRADES_WEEKENDS is False — if Sat/Sun are trading days, there's no
+# "weekend gap" to protect against, so this is skipped entirely (see main.py).
 FRIDAY_FORCE_CLOSE_HOUR_IST = 21
 FRIDAY_FORCE_CLOSE_MINUTE_IST = 30
 
