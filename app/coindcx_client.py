@@ -32,15 +32,14 @@ IST = pytz.timezone("Asia/Kolkata")
 COINDCX_BASE_URL = "https://api.coindcx.com"
 COINDCX_PUBLIC_URL = "https://public.coindcx.com"
 
-# This bot only ever trades these two — kept separate from TradeVerse's SYMBOL_MAP
-# so the two bots can never accidentally collide on a symbol key.
-# *** CORRECTED 2026-07-21 *** — confirmed live: "B-XAU_USDT" does not exist
-# ("Invalid pair" error). The underlying token is XAUT (Tether Gold), matching
-# CoinDCX's spot pair "XAUTUSDT" — so the futures pair follows the same naming
-# convention as BTC. Still worth a live confirmation on first successful entry.
+# *** GOLD DROPPED 2026-07-22 *** — confirmed manually tradeable in the CoinDCX app,
+# but every API order-creation attempt failed with "Instrument is not active" across
+# 4 different fix attempts (INR margin toggle, inline-SL removal, leverage unchanged at
+# 5x). Root cause likely account/API-side (e.g. a leverage-tier or API-trading-permission
+# flag on this specific instrument) rather than anything fixable in this client. Revisit
+# if CoinDCX support clarifies, or re-add "GOLD": "B-XAUT_USDT" below once confirmed working.
 SYMBOL_MAP = {
     "BTC": "B-BTC_USDT",
-    "GOLD": "B-XAUT_USDT",
 }
 REVERSE_SYMBOL_MAP = {v: k for k, v in SYMBOL_MAP.items()}
 
