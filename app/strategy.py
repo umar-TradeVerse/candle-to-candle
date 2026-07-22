@@ -1,8 +1,10 @@
 """
 Candle-to-Candle strategy — pure logic, no exchange calls, no indicators.
 
-Rules (confirmed spec):
-1. Each trading day (Tue-Fri IST), the 01:30 IST 4H candle closes -> mark its high/low
+Rules (confirmed spec — updated 2026-07-22, full week / BTC only):
+1. Each trading day (full week, Mon-Sun IST — originally Tue-Fri only when this ran
+   both BTC and GOLD; GOLD has since been dropped and BTC trades 24/7, so there's no
+   calendar constraint left), the 01:30 IST 4H candle closes -> mark its high/low
    as the day's reference range.
 2. Watch every subsequent candle that day for a close beyond that range.
    - Close above range-high  -> LONG
@@ -14,8 +16,9 @@ Rules (confirmed spec):
 4. On every later candle close, ratchet the SL to that candle's low (long) / high (short),
    again extended by SL_BUFFER_PCT.
 5. No re-entry same day after being stopped out.
-6. Trade can run across multiple days; only exit is the trailing SL, OR a manual /close,
-   OR the mandatory Friday-evening force-close.
+6. Trade can run across multiple days; only exit is the trailing SL or a manual /close.
+   (The old mandatory Friday-evening force-close no longer applies now that weekends
+   are trading days too — see config.py's TRADES_WEEKENDS.)
 """
 from dataclasses import dataclass, field
 from typing import Optional, Literal
