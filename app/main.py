@@ -34,8 +34,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 # embeds the bot token (https://api.telegram.org/bot<TOKEN>/method). Silencing this
 # specific logger to WARNING stops the token from ever appearing in logs, without
 # losing anything useful (our own coindcx/main loggers carry the actual signal).
+# NOTE: only httpx needs this — python-telegram-bot's own logger ("telegram") never
+# includes the token in its messages, so it's left at INFO to keep useful startup
+# confirmations like "Application started" visible.
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.WARNING)
 logger = logging.getLogger("main")
 
 client = CoinDCXClient(COINDCX_API_KEY, COINDCX_API_SECRET)
