@@ -287,6 +287,34 @@ class CoinDCXClient:
         return round(rounded, decimals)
 
     # ---------- trading ----------
+    async def set_leverage(self, symbol: str, leverage: int) -> bool:
+        """
+        *** RESTORED 2026-07-22 ***
+        CoinDCX ties leverage to the pair at the account level, not per-order — an
+        order's "leverage" field must MATCH whatever's already configured for that
+        pair, it doesn't set a new value on its own. Confirmed live via the error
+        "Order leverage must be equal to position leverage" when this bot's config
+        leverage (10x) diverged from whatever the account's B-BTC_USDT pair was still
+        set to (likely 5x, left over from before this config change). This call was
+        present in an earlier draft, dropped when the client was rewritten around
+        TradeVerse's tested code (which never needed it — it always traded at one
+        fixed leverage from day one, so the account was already aligned). Needed again
+        now that this bot's leverage differs from that original setting.
+        """
+        coindcx_symbol = SYMBOL_MAP.get(symbol)
+        if not coindcx_symbol:
+            logger.error(f"Unknown symbol: {symbol}")
+            return False
+
+        timestamp = int(time.time() * 1000)
+        body = {"timestamp": timestamp, "pair": coindcx_symbol, "leverage": leverage}
+        result = await self._post("/exchange/v1/derivatives/futures/positions/create_leverage", body)
+        if result:
+            logger.info(f"{symbol} | Leverage set to {leverage}x")
+            return True
+        logger.error(f"{symbol} | Failed to set leverage to {leverage}x: {self.last_error}")
+        return False
+
     async def place_market_order(self, symbol: str, side: str, quantity: float,
                                   sl_price: float, leverage: int = 5) -> Optional[dict]:
         """
@@ -299,6 +327,9 @@ class CoinDCXClient:
         Decoupling this way works regardless of whether a given instrument supports
         bracket orders, since it never relies on that feature.
 
+        Leverage is explicitly set on the pair BEFORE the order is placed — see
+        set_leverage() above for why this is necessary.
+
         ⚠️ Because this is now two calls, there's a brief window between entry and
         SL attachment where the position exists but has no stop loss protecting it.
         If the SL-attach step fails, the caller MUST be told loudly — see the
@@ -308,6 +339,11 @@ class CoinDCXClient:
         if not coindcx_symbol:
             logger.error(f"Unknown symbol: {symbol}")
             return None
+
+        leverage_ok = await self.set_leverage(symbol, leverage)
+        if not leverage_ok:
+            return {"id": None, "error": f"Failed to set leverage to {leverage}x before entry: "
+                                          f"{self.last_error or 'unknown error'}"}
 
         instrument = await self._get_instrument_details(coindcx_symbol)
         if instrument and instrument["quantity_increment"] > 0:
