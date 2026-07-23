@@ -63,13 +63,9 @@ HEARTBEAT_HOUR_IST = int(os.environ.get("HEARTBEAT_HOUR_IST", "8"))
 HEARTBEAT_MINUTE_IST = int(os.environ.get("HEARTBEAT_MINUTE_IST", "0"))
 
 # ---------- Entry retry ----------
-# If an entry fails (insufficient funds, inactive instrument, etc.), retry — but not
-# every single poll cycle. This throttles retries (and the matching Telegram alert)
-# to once per this many seconds, so a non-transient failure doesn't spam every 30s.
+# If an entry fails, retry — but not every single poll cycle. This throttles retries
+# (and the matching Telegram alert) to once per this many seconds, so a failure doesn't
+# spam every 30s. No day-abandonment cap (removed 2026-07-22 per request) — retries are
+# indefinite, bounded naturally by the candle itself (a new candle closing supersedes
+# the breakout regardless).
 ENTRY_RETRY_BACKOFF_SECONDS = int(os.environ.get("ENTRY_RETRY_BACKOFF_SECONDS", "300"))
-
-# After this many failed attempts on the SAME breakout, stop retrying and go quiet
-# until the next day's fresh anchor range — some failures (e.g. an exchange marking
-# an instrument inactive) aren't going to resolve minute-to-minute, and retrying
-# forever just spams alerts and hammers the API for no benefit.
-MAX_ENTRY_RETRIES = int(os.environ.get("MAX_ENTRY_RETRIES", "3"))
