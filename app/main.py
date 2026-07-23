@@ -20,7 +20,7 @@ from app.config import (
     FRIDAY_FORCE_CLOSE_HOUR_IST, FRIDAY_FORCE_CLOSE_MINUTE_IST,
     POLL_INTERVAL_SECONDS, CANDLE_INTERVAL,
     HEARTBEAT_HOUR_IST, HEARTBEAT_MINUTE_IST,
-    ENTRY_RETRY_BACKOFF_SECONDS, MAX_ENTRY_RETRIES,
+    ENTRY_RETRY_BACKOFF_SECONDS,
     COINDCX_API_KEY, COINDCX_API_SECRET,
 )
 from app.coindcx_client import CoinDCXClient, SYMBOL_MAP
@@ -155,8 +155,6 @@ class SymbolWorker:
                 sym_state["anchor_low"] = anchor.low
                 sym_state["traded_today"] = False
                 sym_state["stopped_out_today"] = False
-                sym_state["entry_attempt_count"] = 0
-                sym_state["entry_abandoned_alert_sent"] = False
                 await self.bot.send_alert(f"[{self.name}] New day range set: H={anchor.high} L={anchor.low}")
 
         ctx = DayContext(
@@ -223,35 +221,25 @@ class SymbolWorker:
         elif not ctx.traded_today and not ctx.stopped_out_today and ctx.anchor_high:
             direction = check_breakout(ctx, last_closed)
             if direction:
-                attempt_count = sym_state.get("entry_attempt_count", 0)
-                if attempt_count >= MAX_ENTRY_RETRIES:
-                    # Give up quietly for today — some failures (e.g. an exchange marking
-                    # an instrument inactive) won't resolve minute-to-minute, and retrying
-                    # forever just spams alerts and hammers the API for no benefit.
-                    if not sym_state.get("entry_abandoned_alert_sent"):
-                        await self.bot.send_alert(
-                            f"[{self.name}] Giving up on today's entry after {attempt_count} failed "
-                            f"attempts — will try again with tomorrow's new range. Check the underlying "
-                            f"issue manually if this keeps happening."
-                        )
-                        sym_state["entry_abandoned_alert_sent"] = True
-                    sym_state["stopped_out_today"] = True  # blocks further attempts today
-                    self.last_seen_candle_open = last_closed.open_time
+                # No day-abandonment cap here (removed 2026-07-22) — that was built for
+                # GOLD's permanent, unfixable "not active" error, where retrying forever
+                # was pointless. BTC's failures so far have been real, fixable bugs
+                # (sizing, leverage mismatch), so retrying indefinitely is the right
+                # default. The 5-minute backoff below still prevents alert/API spam —
+                # only the "give up for the day" ceiling is gone. Bounded naturally by
+                # the candle itself: retries stop mattering once a new candle closes
+                # and supersedes this breakout.
+                last_attempt = sym_state.get("last_entry_attempt_at")
+                seconds_since_attempt = (now.timestamp() - last_attempt) if last_attempt else None
+                if seconds_since_attempt is not None and seconds_since_attempt < ENTRY_RETRY_BACKOFF_SECONDS:
+                    pass  # too soon since last failed attempt — stay quiet, retry later
                 else:
-                    last_attempt = sym_state.get("last_entry_attempt_at")
-                    seconds_since_attempt = (now.timestamp() - last_attempt) if last_attempt else None
-                    if seconds_since_attempt is not None and seconds_since_attempt < ENTRY_RETRY_BACKOFF_SECONDS:
-                        pass  # too soon since last failed attempt — stay quiet, retry later
-                    else:
-                        sym_state["last_entry_attempt_at"] = now.timestamp()
-                        entered = await self.enter(ctx, direction, last_closed, sym_state)
-                        if entered:
-                            self.last_seen_candle_open = last_closed.open_time
-                        else:
-                            sym_state["entry_attempt_count"] = attempt_count + 1
-                        # else (failed): deliberately NOT advancing — retry after the backoff,
-                        # until either it succeeds, hits MAX_ENTRY_RETRIES, or a new candle
-                        # closes and supersedes it
+                    sym_state["last_entry_attempt_at"] = now.timestamp()
+                    entered = await self.enter(ctx, direction, last_closed, sym_state)
+                    if entered:
+                        self.last_seen_candle_open = last_closed.open_time
+                    # else (failed): deliberately NOT advancing — retry after the backoff,
+                    # until either it succeeds or a new candle closes and supersedes it
             else:
                 self.last_seen_candle_open = last_closed.open_time  # no breakout, nothing to retry
         else:
