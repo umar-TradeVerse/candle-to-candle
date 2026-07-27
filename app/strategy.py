@@ -1,24 +1,31 @@
 """
 Candle-to-Candle strategy — pure logic, no exchange calls, no indicators.
 
-Rules (confirmed spec — updated 2026-07-22, full week / BTC only):
-1. Each trading day (full week, Mon-Sun IST — originally Tue-Fri only when this ran
-   both BTC and GOLD; GOLD has since been dropped and BTC trades 24/7, so there's no
-   calendar constraint left), the 01:30 IST 4H candle closes -> mark its high/low
-   as the day's reference range.
-2. Watch every subsequent candle that day for a close beyond that range.
-   - Close above range-high  -> LONG
-   - Close below range-low   -> SHORT
-   - If a single candle's wick pierces BOTH sides, direction is decided by where the
-     CLOSE ends up. If close lands back inside the range, no trigger.
-3. Initial SL = opposite extreme of the anchor (01:30) candle, extended by SL_BUFFER_PCT
-   further out (so a wick-touch of the raw level doesn't stop us out).
-4. On every later candle close, ratchet the SL to that candle's low (long) / high (short),
-   again extended by SL_BUFFER_PCT.
-5. No re-entry same day after being stopped out.
-6. Trade can run across multiple days; only exit is the trailing SL or a manual /close.
-   (The old mandatory Friday-evening force-close no longer applies now that weekends
-   are trading days too — see config.py's TRADES_WEEKENDS.)
+*** STRATEGY REDESIGNED 2026-07-28 *** — entry logic is now confirmation-based on
+15m candles (see detect_touch/check_confirmation/check_setup_invalidated/
+check_entry_trigger below), replacing the old "any candle closing beyond the OR
+triggers immediate entry" approach. The OR construction and post-entry 4H ratchet
+are UNCHANGED — only how we get INTO a trade changed.
+
+New entry rules (confirmed spec):
+1. OR (Opening Range) = the 01:30-05:30 IST synthetic 4H candle, built by aggregating
+   1h candles (unchanged from before) -> anchor_high / anchor_low.
+2. From 05:30 onward, scan 15m candles for a "Candle 1" that touches/breaks the OR
+   level on either side (a candle breaching BOTH sides is treated as ambiguous/no
+   signal, not resolved by close position — see detect_touch).
+3. The very NEXT 15m candle ("Candle 2") must CONFIRM: close beyond the OR level AND
+   not touch that level again (no wick back through it). If it fails to confirm,
+   discard this attempt and go back to scanning for a fresh Candle 1 later that day
+   (does not consume the day's one-trade allowance).
+4. Once confirmed, wait for a LATER candle to CLOSE beyond Candle 2's high (long) /
+   low (short) — that's the actual entry trigger (not intra-candle/live price).
+5. While waiting for that trigger, the setup is invalidated (back to scanning for a
+   fresh Candle 1) if any candle closes back beyond the ORIGINAL OR level.
+6. Initial SL = Candle 2's low (long) / high (short), extended by SL_BUFFER_PCT.
+7. Once in a position, switch to the UNCHANGED 4H ratchet mechanism (ratchet_sl below,
+   using the same 5:30/9:30/13:30/17:30/21:30/1:30 synthetic 4H boundaries).
+8. Max 1 trade/day. No re-entry same day after a stop-out. Position can run across
+   multiple days uninterrupted (no forced close).
 """
 from dataclasses import dataclass, field
 from typing import Optional, Literal
@@ -68,11 +75,72 @@ def build_day_context(anchor_candle: Candle, date_str: str) -> DayContext:
     )
 
 
+# ---------- NEW: confirmation-based entry state machine (15m candles) ----------
+
+def detect_touch(anchor_high: float, anchor_low: float, candle: Candle) -> Optional[Side]:
+    """
+    "Candle 1" detection: does this candle touch/break the OR level on either side?
+    A candle breaching BOTH sides (wide/volatile candle) is ambiguous — skip it
+    rather than guess, and keep scanning on the next candle.
+    """
+    touched_high = candle.high > anchor_high
+    touched_low = candle.low < anchor_low
+    if touched_high and touched_low:
+        return None  # ambiguous, safest to skip
+    if touched_high:
+        return "long"
+    if touched_low:
+        return "short"
+    return None
+
+
+def check_confirmation(anchor_high: float, anchor_low: float, direction: Side, candle: Candle) -> bool:
+    """
+    "Candle 2" confirmation check — applies ONLY to the single candle immediately
+    following Candle 1. Must CLOSE beyond the OR level AND not touch it again
+    (no wick back through it — the entire candle range must stay beyond the level).
+    """
+    if direction == "long":
+        return candle.close > anchor_high and candle.low > anchor_high
+    else:
+        return candle.close < anchor_low and candle.high < anchor_low
+
+
+def check_setup_invalidated(anchor_high: float, anchor_low: float, direction: Side, candle: Candle) -> bool:
+    """
+    While waiting for the entry trigger (after Candle 2 confirmed), the setup is
+    invalidated if any candle closes back beyond the ORIGINAL OR level — i.e. price
+    gave back the whole confirmed move. Back to scanning for a fresh Candle 1.
+    """
+    if direction == "long":
+        return candle.close < anchor_high
+    else:
+        return candle.close > anchor_low
+
+
+def check_entry_trigger(candle2_high: float, candle2_low: float, direction: Side, candle: Candle) -> bool:
+    """Actual entry fires when a (later) candle CLOSES beyond Candle 2's high/low —
+    not on intra-candle/live price crossing it."""
+    if direction == "long":
+        return candle.close > candle2_high
+    else:
+        return candle.close < candle2_low
+
+
+def initial_sl_from_candle2(direction: Side, candle2_low: float, candle2_high: float, buffer_pct: float) -> float:
+    """Initial SL is now based on Candle 2 (the confirmation candle), not the OR
+    candle itself — a meaningful change from the old spec."""
+    if direction == "long":
+        return apply_buffer(candle2_low, direction, True, buffer_pct)
+    return apply_buffer(candle2_high, direction, False, buffer_pct)
+
+
+# ---------- Unchanged: post-entry 4H ratchet ----------
+
 def check_breakout(ctx: DayContext, candle: Candle) -> Optional[Side]:
     """
-    Given a candle that closed AFTER the anchor candle, on the same trading day,
-    determine if it triggers an entry. Returns None if no trigger.
-    Only call this if ctx.traded_today is False and ctx.stopped_out_today is False.
+    *** SUPERSEDED 2026-07-28 by the confirmation state machine above *** — kept here
+    for backward compatibility / reference only, no longer called by main.py.
     """
     broke_high = candle.close > ctx.anchor_high
     broke_low = candle.close < ctx.anchor_low
@@ -82,14 +150,14 @@ def check_breakout(ctx: DayContext, candle: Candle) -> Optional[Side]:
     if broke_low and not broke_high:
         return "short"
     if broke_high and broke_low:
-        # Extremely wide candle that engulfs the range on both sides by wick;
-        # impossible for close to be both above high and below low simultaneously,
-        # this branch is unreachable in practice but kept for completeness.
         return None
     return None  # close landed back inside the range -> no trigger
 
 
 def initial_sl(ctx: DayContext, side: Side, anchor_candle: Candle, buffer_pct: float) -> float:
+    """*** SUPERSEDED 2026-07-28 *** — kept for reference only, use
+    initial_sl_from_candle2() instead. Initial SL is no longer based on the OR
+    candle itself."""
     if side == "long":
         return apply_buffer(ctx.anchor_low, side, True, buffer_pct)
     return apply_buffer(ctx.anchor_high, side, False, buffer_pct)
@@ -97,9 +165,10 @@ def initial_sl(ctx: DayContext, side: Side, anchor_candle: Candle, buffer_pct: f
 
 def ratchet_sl(current_sl: float, side: Side, closed_candle: Candle, buffer_pct: float) -> float:
     """
-    Called every time a NEW candle closes while a position is open.
+    Called every time a NEW synthetic 4H candle closes while a position is open.
     Moves the SL to the just-closed candle's low (long) / high (short) + buffer,
     but NEVER moves it backwards (a ratchet only tightens, never loosens).
+    UNCHANGED by the 2026-07-28 redesign — this only governs post-entry management.
     """
     if side == "long":
         candidate = apply_buffer(closed_candle.low, side, True, buffer_pct)
