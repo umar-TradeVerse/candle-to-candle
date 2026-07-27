@@ -1,14 +1,17 @@
 """
 Candle-to-Candle — main orchestration.
 
+*** STRATEGY REDESIGNED 2026-07-28 *** — entry is now confirmation-based on 15m
+candles (Candle1 touch -> Candle2 confirm -> entry on break of Candle2's high/low),
+replacing the old "any 4H candle closing beyond the OR triggers immediate entry".
+Post-entry management (4H ratchet) is UNCHANGED. See strategy.py's module docstring
+for the full new entry spec.
+
 Built against the tested CoinDCXClient (adapted from TradeVerse's live client):
-  - Entry + SL are ONE call: place_market_order(symbol, side, qty, sl_price, leverage)
-  - Ratcheting SL is ONE call: update_stop_loss(symbol, new_sl_price)
+  - Entry + SL are TWO calls: place_market_order() then update_stop_loss()
   - No separate stop-order ids to track/cancel — the position IS the SL carrier.
 
 BTC-only as of 2026-07-22 (GOLD dropped — see README "Why GOLD was dropped").
-Sizing bug, inline-SL incompatibility, and the Telegram-token-in-logs issue have all
-since been fixed and confirmed live — see README's "Status of previously-flagged items".
 """
 import asyncio
 import logging
@@ -24,7 +27,11 @@ from app.config import (
     COINDCX_API_KEY, COINDCX_API_SECRET,
 )
 from app.coindcx_client import CoinDCXClient, SYMBOL_MAP
-from app.strategy import Candle, DayContext, check_breakout, initial_sl, ratchet_sl
+from app.strategy import (
+    Candle, DayContext, ratchet_sl,
+    detect_touch, check_confirmation, check_setup_invalidated, check_entry_trigger,
+    initial_sl_from_candle2,
+)
 from app.state_store import load_state, save_state, get_symbol_state, set_symbol_state
 from app.telegram_bot import TelegramBot
 
@@ -75,7 +82,8 @@ class SymbolWorker:
     def __init__(self, name, bot: TelegramBot):
         self.name = name  # e.g. "BTC" — matches a key in coindcx_client.SYMBOL_MAP
         self.bot = bot
-        self.last_seen_candle_open = None
+        self.last_seen_candle_open = None      # gates 4H candle processing (ratchet)
+        self.last_seen_15m_candle_open = None  # gates 15m candle processing (pre-entry scan)
 
     async def reconcile(self):
         """On startup: truth comes from the exchange, never assumed from local state."""
@@ -155,6 +163,9 @@ class SymbolWorker:
                 sym_state["anchor_low"] = anchor.low
                 sym_state["traded_today"] = False
                 sym_state["stopped_out_today"] = False
+                sym_state["phase"] = "waiting_touch"
+                sym_state["candle1"] = None
+                sym_state["candle2"] = None
                 await self.bot.send_alert(f"[{self.name}] New day range set: H={anchor.high} L={anchor.low}")
 
         ctx = DayContext(
@@ -219,62 +230,131 @@ class SymbolWorker:
             else:
                 self.last_seen_candle_open = last_closed.open_time  # nothing to ratchet, mark handled
         elif not ctx.traded_today and not ctx.stopped_out_today and ctx.anchor_high:
-            direction = check_breakout(ctx, last_closed)
-            if direction:
-                # No day-abandonment cap here (removed 2026-07-22) — that was built for
-                # GOLD's permanent, unfixable "not active" error, where retrying forever
-                # was pointless. BTC's failures so far have been real, fixable bugs
-                # (sizing, leverage mismatch), so retrying indefinitely is the right
-                # default. The 5-minute backoff below still prevents alert/API spam —
-                # only the "give up for the day" ceiling is gone. Bounded naturally by
-                # the candle itself: retries stop mattering once a new candle closes
-                # and supersedes this breakout.
-                last_attempt = sym_state.get("last_entry_attempt_at")
-                seconds_since_attempt = (now.timestamp() - last_attempt) if last_attempt else None
-                if seconds_since_attempt is not None and seconds_since_attempt < ENTRY_RETRY_BACKOFF_SECONDS:
-                    pass  # too soon since last failed attempt — stay quiet, retry later
-                else:
-                    sym_state["last_entry_attempt_at"] = now.timestamp()
-                    entered = await self.enter(ctx, direction, last_closed, sym_state)
-                    if entered:
-                        self.last_seen_candle_open = last_closed.open_time
-                    # else (failed): deliberately NOT advancing — retry after the backoff,
-                    # until either it succeeds or a new candle closes and supersedes it
-            else:
-                self.last_seen_candle_open = last_closed.open_time  # no breakout, nothing to retry
+            self.last_seen_candle_open = last_closed.open_time  # 4H tracker still advances; pre-entry uses 15m
+            await self.handle_pre_entry(sym_state, ctx, now)
         else:
             self.last_seen_candle_open = last_closed.open_time  # nothing actionable this cycle
 
         state = set_symbol_state(state, self.name, sym_state)
         save_state(state)
 
-    async def enter(self, ctx, direction, trigger_candle, sym_state):
+    async def handle_pre_entry(self, sym_state, ctx, now):
+        """
+        Confirmation-based entry state machine, operating on 15m candles (unlike the
+        4H candles used for the OR itself and the post-entry ratchet). Phases:
+        waiting_touch -> waiting_confirmation -> waiting_entry -> entering -> (done)
+        """
+        phase = sym_state.get("phase", "waiting_touch")
+        anchor_high, anchor_low = ctx.anchor_high, ctx.anchor_low
+
+        if phase == "entering":
+            # Trigger already fired — retry entry with backoff regardless of new candles,
+            # same pattern as the old entry retry (indefinite, bounded only by day end).
+            last_attempt = sym_state.get("last_entry_attempt_at")
+            seconds_since = (now.timestamp() - last_attempt) if last_attempt else None
+            if seconds_since is not None and seconds_since < ENTRY_RETRY_BACKOFF_SECONDS:
+                return
+            candle1, candle2 = sym_state.get("candle1"), sym_state.get("candle2")
+            if not candle1 or not candle2:
+                logger.error(f"[{self.name}] phase=entering but candle1/candle2 missing — resetting to scan")
+                sym_state["phase"] = "waiting_touch"
+                return
+            sym_state["last_entry_attempt_at"] = now.timestamp()
+            entered = await self.enter_confirmed(candle1["direction"], candle2, sym_state)
+            if entered:
+                sym_state["phase"] = None
+                sym_state["candle1"] = None
+                sym_state["candle2"] = None
+            return
+
+        # waiting_touch / waiting_confirmation / waiting_entry all gate on a NEW 15m candle
+        candles_raw = await client.get_futures_candles(self.name, interval="15m", lookback_days=1, limit=100)
+        if len(candles_raw) < 2:
+            return
+        candles_15m = [to_candle(c) for c in candles_raw]
+        last_closed_15m = candles_15m[-2]  # last item is still-forming
+
+        if sym_state.get("last_seen_15m_open") == last_closed_15m.open_time:
+            return
+        sym_state["last_seen_15m_open"] = last_closed_15m.open_time
+
+        if phase == "waiting_touch":
+            direction = detect_touch(anchor_high, anchor_low, last_closed_15m)
+            if direction:
+                sym_state["candle1"] = {
+                    "open_time": last_closed_15m.open_time,
+                    "high": last_closed_15m.high, "low": last_closed_15m.low,
+                    "direction": direction,
+                }
+                sym_state["phase"] = "waiting_confirmation"
+                logger.info(f"[{self.name}] Candle1 touch detected ({direction}) @ {last_closed_15m.open_time}")
+
+        elif phase == "waiting_confirmation":
+            candle1 = sym_state.get("candle1")
+            direction = candle1["direction"]
+            if check_confirmation(anchor_high, anchor_low, direction, last_closed_15m):
+                sym_state["candle2"] = {
+                    "open_time": last_closed_15m.open_time,
+                    "high": last_closed_15m.high, "low": last_closed_15m.low,
+                }
+                sym_state["phase"] = "waiting_entry"
+                trigger_level = last_closed_15m.high if direction == "long" else last_closed_15m.low
+                await self.bot.send_alert(
+                    f"[{self.name}] Candle2 confirmed {direction.upper()} — watching for a close "
+                    f"beyond {trigger_level:.2f} to enter"
+                )
+            else:
+                # Failed confirmation (retest or no close beyond) — discard, scan fresh.
+                # Does NOT consume the day's one-trade allowance.
+                sym_state["phase"] = "waiting_touch"
+                sym_state["candle1"] = None
+
+        elif phase == "waiting_entry":
+            candle1, candle2 = sym_state.get("candle1"), sym_state.get("candle2")
+            direction = candle1["direction"]
+            if check_setup_invalidated(anchor_high, anchor_low, direction, last_closed_15m):
+                sym_state["phase"] = "waiting_touch"
+                sym_state["candle1"] = None
+                sym_state["candle2"] = None
+                await self.bot.send_alert(f"[{self.name}] Setup invalidated (gave back the move) — rescanning")
+                return
+            if check_entry_trigger(candle2["high"], candle2["low"], direction, last_closed_15m):
+                sym_state["phase"] = "entering"
+                sym_state["last_entry_attempt_at"] = now.timestamp()
+                entered = await self.enter_confirmed(direction, candle2, sym_state)
+                if entered:
+                    sym_state["phase"] = None
+                    sym_state["candle1"] = None
+                    sym_state["candle2"] = None
+
+    async def enter_confirmed(self, direction, candle2, sym_state):
         side = "buy" if direction == "long" else "sell"
         usdt_inr_rate = await client.get_usdt_inr_rate()
         if not usdt_inr_rate or usdt_inr_rate <= 0:
             logger.error(f"[{self.name}] could not fetch USDT/INR rate — aborting entry rather than risk mis-sizing")
             await self.bot.send_alert(f"[{self.name}] ENTRY BLOCKED: couldn't fetch USDT/INR rate, will retry")
             return False
-        qty = self.compute_quantity(trigger_candle.close, usdt_inr_rate)
-        sl_price = initial_sl(ctx, direction, trigger_candle, SL_BUFFER_PCT)
+        sl_price = initial_sl_from_candle2(direction, candle2["low"], candle2["high"], SL_BUFFER_PCT)
+        ref_price = candle2["high"] if direction == "long" else candle2["low"]
+        qty = self.compute_quantity(ref_price, usdt_inr_rate)
         result = await client.place_market_order(self.name, side, qty, sl_price, LEVERAGE)
-        sym_state["pending_sl"] = sl_price  # retained even on failure, so retries know the target
+        sym_state["pending_sl"] = sl_price
         if result and result.get("id"):
             sym_state["traded_today"] = True
             sym_state["position_side"] = direction
             if result.get("sl_attach_failed"):
-                # Position IS open on the exchange but has NO stop-loss protecting it —
-                # this is worse than a failed entry, it's a live unprotected position.
                 sym_state["current_sl"] = None
                 await self.bot.send_alert(
-                    f"🚨 [{self.name}] ENTERED {direction.upper()} at ~{trigger_candle.close:.2f} but "
-                    f"SL ATTACHMENT FAILED — position is UNPROTECTED. Check CoinDCX and set a stop "
-                    f"manually NOW, or use /close {self.name} to flatten."
+                    f"🚨 [{self.name}] ENTERED {direction.upper()} but SL ATTACHMENT FAILED — position "
+                    f"is UNPROTECTED. Check CoinDCX now, or /close {self.name}."
                 )
             else:
                 sym_state["current_sl"] = sl_price
                 await self.bot.send_alert(
-                    f"[{self.name}] ENTERED {direction.upper()} at ~{trigger_candle.close:.2f}, SL={sl_price:.2f}"
+                    f"{self.name} {direction.upper()}\n"
+                    f"Opening Range: H={sym_state.get('anchor_high')} L={sym_state.get('anchor_low')}\n"
+                    f"SL: {sl_price:.2f} (from Candle2 {'low' if direction == 'long' else 'high'})\n"
+                    f"Trade Status: ACTIVE"
                 )
             return True
         else:
@@ -311,7 +391,19 @@ class SymbolWorker:
     async def status_line(self):
         details = await client.get_position_details(self.name)
         if not details or not details.get("active_pos"):
-            return f"{self.name}: flat"
+            state = load_state()
+            sym_state = get_symbol_state(state, self.name)
+            phase = sym_state.get("phase", "waiting_touch")
+            anchor_high, anchor_low = sym_state.get("anchor_high"), sym_state.get("anchor_low")
+            phase_label = {
+                "waiting_touch": "waiting for Candle1 touch",
+                "waiting_confirmation": "waiting for Candle2 confirmation",
+                "waiting_entry": "confirmed, watching for entry trigger",
+                "entering": "entry trigger fired, placing order",
+                None: "no active setup",
+            }.get(phase, phase)
+            or_str = f" | OR: H={anchor_high} L={anchor_low}" if anchor_high else ""
+            return f"{self.name}: flat ({phase_label}){or_str}"
         roe = details.get("roe")
         roe_str = f"{roe:.2f}%" if roe is not None else "n/a"
         return (f"{self.name}: {'LONG' if details['active_pos'] > 0 else 'SHORT'} "
