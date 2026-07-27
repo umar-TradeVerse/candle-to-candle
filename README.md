@@ -4,31 +4,46 @@ Independent trading bot — separate repo, separate Railway service, separate Te
 Shares the CoinDCX API key/secret with TradeVerse (account-level key, no conflict since
 symbols don't overlap).
 
-## Strategy (confirmed spec — updated 2026-07-22)
+## Strategy (confirmed spec — REDESIGNED 2026-07-28)
 
-- 4H candles, IST. 6 candles/day: 01:30, 05:30, 09:30, 13:30, 17:30, 21:30.
-- **Trading days: full week (Mon–Sun)**. Originally Tue–Fri only, back when this ran
-  both BTC and GOLD (GOLD trades Mon–Fri only, so Tue–Fri was a shared-calendar
-  compromise). GOLD has since been dropped entirely (see below) and BTC trades 24/7,
-  so there's no constraint left — full week, including weekends.
-- Each day: the **01:30 candle closes** (i.e. the 4H candle built from the 1:30, 2:30,
-  3:30, 4:30 hourly bars, closing at 5:30) → its high/low becomes the day's reference range.
-- Watch **every later candle that day** for a close beyond the range:
-  - close above range-high → **long**
-  - close below range-low → **short**
-  - a candle wicking through both sides → direction decided by where the **close** lands
-- **Initial SL** = opposite extreme of the 01:30 candle, extended **0.5–1% further out**
-  (buffer so a wick-touch doesn't stop us out on noise).
-- On every subsequent candle close, **ratchet the SL** to that candle's low (long) /
-  high (short), same buffer applied. Ratchet only tightens, never loosens. Every
-  candle close now logs the check explicitly (candle extreme, current SL, candidate
-  SL, tightened-or-not) — not just when it actually changes.
-- **No re-entry same day** after a stop-out.
-- Trade can run across multiple days — only exits are: trailing SL hit, or manual `/close`.
-  (The old mandatory Friday force-close no longer applies now that weekends are
-  trading days — there's no "gap" left to protect against.)
+**Entry logic changed significantly. Post-entry management did not.**
+
+### Opening Range (unchanged)
+- 4H candles, IST. The **01:30–05:30 IST candle** (built from the 1:30/2:30/3:30/4:30
+  hourly bars) marks the day's **Opening Range** — its high/low.
+- **Trading days: full week (Mon–Sun)** — no calendar constraint since GOLD (Mon-Fri
+  only) was dropped and BTC trades 24/7.
+
+### Entry — confirmation-based, on 15m candles (NEW)
+The old "any candle closing beyond the OR triggers immediate entry" is gone. Entry now
+requires a two-candle confirmation on the 15m timeframe:
+
+1. **Candle 1** touches/breaks the OR high or low (a candle piercing both sides is
+   ambiguous — skipped, not resolved by guessing).
+2. **Candle 2** (the very next 15m candle) must **CLOSE beyond** that OR level **and
+   not touch it again** (no wick back through) — this is "confirmation"/"acceptance".
+   If Candle 2 fails this (retests the level, or doesn't close beyond it), the attempt
+   is discarded and the bot goes back to scanning for a fresh Candle 1 later the same
+   day — this does **not** consume the day's one-trade allowance.
+3. Once confirmed, the bot waits for a **later candle to CLOSE beyond Candle 2's
+   high** (long) / **low** (short) — that's the actual entry trigger. Live/intra-candle
+   price crossing it does NOT count; a close is required, same as the OR confirmation.
+4. While waiting for that trigger, the setup is **invalidated** if any candle closes
+   back beyond the *original* OR level — back to scanning for a fresh Candle 1.
+5. **Initial SL = Candle 2's low (long) / high (short)** — extended 0.5–1% further out
+   (buffer against wick stop-outs). This is a change from before: SL used to be based
+   on the OR candle itself; now it's based on the confirmation candle, which is
+   typically much tighter.
+6. **Max 1 trade per day.** No re-entry same day after a stop-out.
+
+### Post-entry management (UNCHANGED)
+- Once in a position, switch to **4H synthetic candles** (5:30–9:30, 9:30–13:30,
+  13:30–17:30, 17:30–21:30, 21:30–1:30).
+- On every 4H close, **ratchet the SL** to that candle's low (long) / high (short),
+  same buffer. Ratchet only tightens, never loosens.
 - **No fixed take-profit** — the trail is the only automated exit.
-- Zero indicators. Pure OHLC.
+- Position can run across multiple days uninterrupted — no forced close.
+- Zero indicators anywhere. Pure OHLC.
 - **₹10,000 position size, 10x leverage**, INR margin, BTC only.
 
 ## Why GOLD was dropped
@@ -76,7 +91,23 @@ the exchange shows flat, that's treated as a stop-out automatically. This is the
 failure mode that bit TradeVerse (in-memory-only state wiped on redeploy) — designed
 out here from day one.
 
-## ⚠️ Status of previously-flagged items
+## ⚠️ IMPORTANT: leverage must be set manually, one time, before running the bot
+
+CoinDCX ties leverage to a persistent per-pair "position card", not to individual
+orders — confirmed via their own docs: *"The leverage displayed on your position card
+represents the leverage that will be applied to all futures orders and the position."*
+Adjusting it is an add/remove-margin flow in their app, not a simple API value you can
+set. Two guessed API endpoints for this both failed (one didn't exist, `404`; the other
+was rejected outright) — rather than keep guessing against real money, this client
+does **not** attempt to set leverage at all.
+
+**Before running the bot (or whenever you change `LEVERAGE` in `config.py`):**
+1. Open the CoinDCX app → B-BTC_USDT futures screen
+2. Use the **"Adjust Leverage"** button to set it to match `config.LEVERAGE` exactly
+3. Only then will the bot's orders (which send that same leverage inline) succeed —
+   otherwise every entry fails with `"Order leverage must be equal to position leverage"`
+
+## Status of previously-flagged items
 
 1. **INR margin currency** — confirmed working for BTC in production (real entry
    executed, position confirmed INR-margined via CoinDCX app screenshot).
