@@ -292,6 +292,23 @@ class SymbolWorker:
         elif phase == "waiting_confirmation":
             candle1 = sym_state.get("candle1")
             direction = candle1["direction"]
+
+            # Adjacency check: Candle 2 must be the IMMEDIATE next 15m candle after
+            # Candle 1 — not just "whatever candle we next happened to see". If a
+            # Railway restart, network blip, or missed poll caused a gap, treat this
+            # as an invalid confirmation window rather than silently confirming
+            # against a non-adjacent candle. Reset and let normal scanning resume.
+            expected_gap_ms = 15 * 60 * 1000
+            actual_gap_ms = last_closed_15m.open_time - candle1["open_time"]
+            if actual_gap_ms != expected_gap_ms:
+                logger.warning(
+                    f"[{self.name}] Candle2 check skipped — gap was {actual_gap_ms}ms, "
+                    f"expected {expected_gap_ms}ms (missed candle/downtime?). Resetting to scan fresh."
+                )
+                sym_state["phase"] = "waiting_touch"
+                sym_state["candle1"] = None
+                return
+
             if check_confirmation(anchor_high, anchor_low, direction, last_closed_15m):
                 sym_state["candle2"] = {
                     "open_time": last_closed_15m.open_time,
