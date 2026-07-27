@@ -388,8 +388,9 @@ class CoinDCXClient:
         order_id = order_obj.get("id")
         logger.info(f"{symbol} {side} market order placed (no inline SL): {order_id}")
 
-        # Brief settle time so the position is queryable before we try to attach the SL.
-        await asyncio.sleep(1.5)
+        # No fixed sleep here anymore — update_stop_loss's position lookup (via
+        # _find_open_position_id) now retries internally with its own delay/backoff,
+        # which is more robust than a single fixed wait that turned out too short.
         sl_ok = await self.update_stop_loss(symbol, sl_price)
         if sl_ok:
             return {"id": order_id, "symbol": symbol, "side": side, "quantity": quantity,
@@ -490,6 +491,35 @@ class CoinDCXClient:
         logger.error(f"{symbol} | Failed to close position: {self.last_error}")
         return False
 
+    async def _find_open_position_id(self, coindcx_symbol: str, max_attempts: int = 5,
+                                      delay_seconds: float = 1.0) -> Optional[str]:
+        """
+        Look up the open position's id for this pair, RETRYING a few times rather than
+        asking once. Fixes a real timing bug seen live: a fixed 1.5s sleep after entry
+        wasn't always enough for CoinDCX to register the new position before the very
+        next query, causing "Could not find an open position id — SL not updated" even
+        though the position existed moments later. Retries up to `max_attempts` times,
+        `delay_seconds` apart, before giving up.
+        """
+        for attempt in range(max_attempts):
+            timestamp = int(time.time() * 1000)
+            positions_result = await self._post("/exchange/v1/derivatives/futures/positions", {"timestamp": timestamp})
+            entries = positions_result if isinstance(positions_result, list) else []
+            for entry in entries:
+                if not isinstance(entry, dict) or entry.get("pair") != coindcx_symbol:
+                    continue
+                try:
+                    active = float(entry.get("active_pos", 0) or 0)
+                except (TypeError, ValueError):
+                    active = 0.0
+                if active != 0:
+                    return entry.get("id")
+            if attempt < max_attempts - 1:
+                logger.warning(f"{coindcx_symbol} | Position not found yet (attempt {attempt + 1}/{max_attempts}), "
+                               f"retrying in {delay_seconds}s")
+                await asyncio.sleep(delay_seconds)
+        return None
+
     async def update_stop_loss(self, symbol: str, new_sl_price: float) -> bool:
         """Ratchets the SL by updating the position's TP/SL directly — no cancel/recreate."""
         coindcx_symbol = SYMBOL_MAP.get(symbol)
@@ -497,26 +527,12 @@ class CoinDCXClient:
             logger.error(f"{symbol} | Unknown symbol, cannot update SL")
             return False
 
-        timestamp = int(time.time() * 1000)
-        positions_result = await self._post("/exchange/v1/derivatives/futures/positions", {"timestamp": timestamp})
-        entries = positions_result if isinstance(positions_result, list) else []
-
-        position_id = None
-        for entry in entries:
-            if not isinstance(entry, dict) or entry.get("pair") != coindcx_symbol:
-                continue
-            try:
-                active = float(entry.get("active_pos", 0) or 0)
-            except (TypeError, ValueError):
-                active = 0.0
-            if active != 0:
-                position_id = entry.get("id")
-                break
-
+        position_id = await self._find_open_position_id(coindcx_symbol)
         if not position_id:
-            logger.error(f"{symbol} | Could not find an open position id — SL not updated")
+            logger.error(f"{symbol} | Could not find an open position id after retries — SL not updated")
             return False
 
+        timestamp = int(time.time() * 1000)
         instrument = await self._get_instrument_details(coindcx_symbol)
         if instrument and instrument["price_increment"] > 0:
             new_sl_price = self._round_to_increment(new_sl_price, instrument["price_increment"], mode="nearest")
