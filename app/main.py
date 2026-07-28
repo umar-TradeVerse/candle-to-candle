@@ -323,6 +323,18 @@ class SymbolWorker:
             else:
                 # Failed confirmation (retest or no close beyond) — discard, scan fresh.
                 # Does NOT consume the day's one-trade allowance.
+                if direction == "long":
+                    reason = ("no close beyond OR high" if last_closed_15m.close <= anchor_high
+                              else "retested OR high (low touched back through)")
+                else:
+                    reason = ("no close beyond OR low" if last_closed_15m.close >= anchor_low
+                              else "retested OR low (high touched back through)")
+                logger.info(
+                    f"[{self.name}] Candle2 confirmation FAILED ({direction}, {reason}) — "
+                    f"candle O={last_closed_15m.open} H={last_closed_15m.high} "
+                    f"L={last_closed_15m.low} C={last_closed_15m.close} @ {last_closed_15m.open_time}. "
+                    f"Resetting to scan fresh (does not use up today's one-trade allowance)."
+                )
                 sym_state["phase"] = "waiting_touch"
                 sym_state["candle1"] = None
 
