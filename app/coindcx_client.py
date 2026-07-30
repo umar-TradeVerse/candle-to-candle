@@ -43,6 +43,15 @@ SYMBOL_MAP = {
 }
 REVERSE_SYMBOL_MAP = {v: k for k, v in SYMBOL_MAP.items()}
 
+
+class CoinDCXError(Exception):
+    """Raised when an API call itself fails (network, timeout, non-2xx response) —
+    used specifically so callers can distinguish 'the call failed, status unknown'
+    from 'the call succeeded and confirmed no position exists'. Conflating these two
+    caused a real live incident (a genuinely open, profitable position got marked as
+    closed/flat after a transient API failure)."""
+    pass
+
 # *** FLAGGED FOR REVIEW ***
 # TradeVerse's tested client never set this (its pairs are USDT-margined and just used
 # the account's implicit default). Since this bot specifically wants INR margin, we set
@@ -437,13 +446,25 @@ class CoinDCXClient:
         return positions
 
     async def get_position_details(self, symbol: str) -> Optional[dict]:
-        """Open position + manually-computed ROE (verified against CoinDCX's own UI)."""
+        """
+        Open position + manually-computed ROE (verified against CoinDCX's own UI).
+
+        *** CRITICAL FIX 2026-07-30 *** — same class of bug as get_open_positions():
+        raises CoinDCXError if the underlying API call itself fails, instead of
+        silently returning None (which every caller interprets as "confirmed no
+        position"). This method is used by BOTH reconcile() at startup and /status —
+        a live incident showed a real, open, profitable position invisible to both
+        because a failed API call looked identical to "flat". Callers MUST catch
+        CoinDCXError and treat it as "unknown", never as confirmation of no position.
+        """
         coindcx_symbol = SYMBOL_MAP.get(symbol)
         if not coindcx_symbol:
             return None
 
         timestamp = int(time.time() * 1000)
         result = await self._post("/exchange/v1/derivatives/futures/positions", {"timestamp": timestamp})
+        if result is None:
+            raise CoinDCXError(f"get_position_details: API call failed for {symbol} — status unknown")
         entries = result if isinstance(result, list) else []
 
         for entry in entries:
