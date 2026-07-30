@@ -26,7 +26,7 @@ from app.config import (
     ENTRY_RETRY_BACKOFF_SECONDS,
     COINDCX_API_KEY, COINDCX_API_SECRET,
 )
-from app.coindcx_client import CoinDCXClient, SYMBOL_MAP
+from app.coindcx_client import CoinDCXClient, SYMBOL_MAP, CoinDCXError
 from app.strategy import (
     Candle, DayContext, ratchet_sl,
     detect_touch, check_confirmation, check_setup_invalidated, check_entry_trigger,
@@ -86,10 +86,22 @@ class SymbolWorker:
         self.last_seen_15m_candle_open = None  # gates 15m candle processing (pre-entry scan)
 
     async def reconcile(self):
-        """On startup: truth comes from the exchange, never assumed from local state."""
-        details = await client.get_position_details(self.name)
+        """On startup: truth comes from the exchange, never assumed from local state.
+
+        *** CRITICAL FIX 2026-07-30 *** — if the API call fails, do NOT touch
+        position_side/current_sl at all. A real incident happened where an API
+        failure at exactly this point silently reset a genuinely open, profitable
+        position to "flat" in our state — leaving it completely unmanaged. Trust
+        whatever was persisted if we can't verify; sync_position_state will get
+        another chance to check on the very next poll cycle."""
         state = load_state()
         sym_state = get_symbol_state(state, self.name)
+        try:
+            details = await client.get_position_details(self.name)
+        except CoinDCXError:
+            logger.error(f"[{self.name}] reconcile: could not verify position status (API failed) — "
+                         f"leaving persisted state untouched, will re-check next poll cycle")
+            return
 
         if details and details.get("active_pos"):
             side = "long" if details["active_pos"] > 0 else "short"
@@ -446,7 +458,10 @@ class SymbolWorker:
         sym_state["current_sl"] = None
 
     async def status_line(self):
-        details = await client.get_position_details(self.name)
+        try:
+            details = await client.get_position_details(self.name)
+        except CoinDCXError:
+            return f"{self.name}: status check FAILED (API error) — try again shortly, not confirmed flat"
         if not details or not details.get("active_pos"):
             state = load_state()
             sym_state = get_symbol_state(state, self.name)
