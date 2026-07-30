@@ -400,10 +400,26 @@ class CoinDCXClient:
         return {"id": order_id, "symbol": symbol, "side": side, "quantity": quantity,
                  "sl_price": sl_price, "leverage": leverage, "sl_attach_failed": True}
 
-    async def get_open_positions(self) -> dict:
-        """Returns {internal_symbol: active_pos} for currently-open positions only."""
+    async def get_open_positions(self) -> Optional[dict]:
+        """
+        Returns {internal_symbol: active_pos} for currently-open positions.
+
+        *** CRITICAL FIX 2026-07-30 *** — returns None (not {}) if the API call itself
+        fails, so callers can tell "confirmed no open positions" apart from "couldn't
+        check right now". Before this fix, ANY failure (network blip, timeout,
+        CoinDCX API hiccup — exactly the kind already seen elsewhere in these logs)
+        was silently treated as "position doesn't exist", which caused a real live
+        incident: a genuinely still-open position got marked as closed in our state
+        after what was actually just a failed API call, not a real close. Callers
+        MUST check for None and treat it as "unknown, don't change anything" — never
+        as confirmation of a close.
+        """
         timestamp = int(time.time() * 1000)
         result = await self._post("/exchange/v1/derivatives/futures/positions", {"timestamp": timestamp})
+
+        if result is None:
+            logger.error("get_open_positions: API call failed — returning None (NOT confirming positions closed)")
+            return None
 
         entries = result if isinstance(result, list) else (result.get("positions", []) if result else [])
         positions = {}
@@ -491,15 +507,22 @@ class CoinDCXClient:
         logger.error(f"{symbol} | Failed to close position: {self.last_error}")
         return False
 
-    async def _find_open_position_id(self, coindcx_symbol: str, max_attempts: int = 5,
+    async def _find_open_position_id(self, coindcx_symbol: str, max_attempts: int = 12,
                                       delay_seconds: float = 1.0) -> Optional[str]:
         """
-        Look up the open position's id for this pair, RETRYING a few times rather than
-        asking once. Fixes a real timing bug seen live: a fixed 1.5s sleep after entry
-        wasn't always enough for CoinDCX to register the new position before the very
-        next query, causing "Could not find an open position id — SL not updated" even
-        though the position existed moments later. Retries up to `max_attempts` times,
-        `delay_seconds` apart, before giving up.
+        Look up the open position's id for this pair, RETRYING with increasing backoff
+        rather than asking once (or even a few times) and giving up.
+
+        *** STRENGTHENED 2026-07-30 *** — the original 5-attempts/1s-apart version
+        (≈5 seconds total) was confirmed live to still be insufficient: a real entry
+        had its SL-attachment fail after exhausting all 5 attempts, leaving a live,
+        leveraged position with NO stop-loss for the time it stayed open. Now retries
+        up to `max_attempts` times with backoff increasing from `delay_seconds` up to
+        a 3s cap (12 attempts ≈ 27 seconds total) — a much larger safety margin for
+        CoinDCX's position-registration delay under real (especially volatile) market
+        conditions, before giving up. The caller (place_market_order) and the
+        candle-independent "still unprotected" retry loop in main.py remain as
+        further backstops if even this is somehow exhausted.
         """
         for attempt in range(max_attempts):
             timestamp = int(time.time() * 1000)
@@ -515,9 +538,10 @@ class CoinDCXClient:
                 if active != 0:
                     return entry.get("id")
             if attempt < max_attempts - 1:
+                wait = min(delay_seconds + attempt * 0.5, 3.0)
                 logger.warning(f"{coindcx_symbol} | Position not found yet (attempt {attempt + 1}/{max_attempts}), "
-                               f"retrying in {delay_seconds}s")
-                await asyncio.sleep(delay_seconds)
+                               f"retrying in {wait}s")
+                await asyncio.sleep(wait)
         return None
 
     async def update_stop_loss(self, symbol: str, new_sl_price: float) -> bool:
