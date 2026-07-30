@@ -52,6 +52,17 @@ class CoinDCXError(Exception):
     closed/flat after a transient API failure)."""
     pass
 
+# *** CRITICAL FIX 2026-07-30 ***
+# All three /exchange/v1/derivatives/futures/positions calls below (in
+# get_open_positions, get_position_details, and _find_open_position_id) now send
+# explicit {"page": "1", "size": "100"} instead of just {"timestamp": ...}.
+# Real incident: reconcile() correctly received a successful API response but still
+# failed to find a genuinely open BTC position. This account is shared with
+# TradeVerse, which trades multiple symbols concurrently — if this endpoint paginates
+# and defaults to a small page size without explicit params, TradeVerse's other open
+# positions could crowd this bot's position out of the returned page entirely. A
+# generous explicit size makes this failure mode far less likely.
+
 # *** FLAGGED FOR REVIEW ***
 # TradeVerse's tested client never set this (its pairs are USDT-margined and just used
 # the account's implicit default). Since this bot specifically wants INR margin, we set
@@ -424,7 +435,7 @@ class CoinDCXClient:
         as confirmation of a close.
         """
         timestamp = int(time.time() * 1000)
-        result = await self._post("/exchange/v1/derivatives/futures/positions", {"timestamp": timestamp})
+        result = await self._post("/exchange/v1/derivatives/futures/positions", {"timestamp": timestamp, "page": "1", "size": "100"})
 
         if result is None:
             logger.error("get_open_positions: API call failed — returning None (NOT confirming positions closed)")
@@ -462,7 +473,7 @@ class CoinDCXClient:
             return None
 
         timestamp = int(time.time() * 1000)
-        result = await self._post("/exchange/v1/derivatives/futures/positions", {"timestamp": timestamp})
+        result = await self._post("/exchange/v1/derivatives/futures/positions", {"timestamp": timestamp, "page": "1", "size": "100"})
         if result is None:
             raise CoinDCXError(f"get_position_details: API call failed for {symbol} — status unknown")
         entries = result if isinstance(result, list) else []
@@ -490,6 +501,14 @@ class CoinDCXClient:
             roe = (pnl / margin) * 100
             return {"id": entry.get("id"), "active_pos": active, "roe": roe,
                      "pnl": pnl, "mark_price": mark_price, "avg_price": avg_price, "raw": entry}
+
+        # Call succeeded but coindcx_symbol wasn't found active among the returned
+        # entries. Log exactly what WAS returned — if this keeps happening even with
+        # explicit pagination, this log tells us definitively whether it's still a
+        # pagination/count issue (few entries, real position just isn't among them)
+        # or something else entirely (e.g. a pair-name/field mismatch).
+        seen_pairs = [(e.get("pair"), e.get("active_pos")) for e in entries if isinstance(e, dict)]
+        logger.info(f"{symbol} | No active position found among {len(entries)} returned entries: {seen_pairs}")
         return None
 
     async def close_position_market(self, symbol: str, side: str, quantity: float) -> bool:
@@ -547,7 +566,7 @@ class CoinDCXClient:
         """
         for attempt in range(max_attempts):
             timestamp = int(time.time() * 1000)
-            positions_result = await self._post("/exchange/v1/derivatives/futures/positions", {"timestamp": timestamp})
+            positions_result = await self._post("/exchange/v1/derivatives/futures/positions", {"timestamp": timestamp, "page": "1", "size": "100"})
             entries = positions_result if isinstance(positions_result, list) else []
             for entry in entries:
                 if not isinstance(entry, dict) or entry.get("pair") != coindcx_symbol:
