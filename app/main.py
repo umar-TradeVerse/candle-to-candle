@@ -201,12 +201,11 @@ class SymbolWorker:
             save_state(state)
             return
 
-        if last_closed.open_time == self.last_seen_candle_open:
-            state = set_symbol_state(state, self.name, sym_state)
-            save_state(state)
-            return
-
         if ctx.position_side:
+            if last_closed.open_time == self.last_seen_candle_open:
+                state = set_symbol_state(state, self.name, sym_state)
+                save_state(state)
+                return
             new_sl = ratchet_sl(ctx.current_sl, ctx.position_side, last_closed, SL_BUFFER_PCT)
             candle_extreme = last_closed.low if ctx.position_side == "long" else last_closed.high
             logger.info(
@@ -229,10 +228,27 @@ class SymbolWorker:
                     # or the position closes some other way (sync_position_state handles that)
             else:
                 self.last_seen_candle_open = last_closed.open_time  # nothing to ratchet, mark handled
+
         elif not ctx.traded_today and not ctx.stopped_out_today and ctx.anchor_high:
-            self.last_seen_candle_open = last_closed.open_time  # 4H tracker still advances; pre-entry uses 15m
+            # *** CRITICAL FIX 2026-07-30 ***
+            # This branch must run EVERY poll cycle, NOT gated behind the 4H candle
+            # check above — that check only applies to the ratchet path. The old code
+            # had this branch behind the same "if last_closed.open_time ==
+            # self.last_seen_candle_open: return" guard as the ratchet, which meant the
+            # entire 15m confirmation state machine only ever ran once every 4 HOURS
+            # (whenever the 4H candle itself changed), not every 15 minutes as designed.
+            # Confirmed live via logs: every Candle1 touch appeared only at exact 4H
+            # boundary times, and "Candle2 check" gaps were always exactly 14,400,000ms
+            # (4h) — proof the pre-entry scan was silently starved between those moments.
+            # handle_pre_entry() has its own internal 15m-candle gating, so it's safe
+            # and correct to call it unconditionally on every poll.
             await self.handle_pre_entry(sym_state, ctx, now)
+
         else:
+            if last_closed.open_time == self.last_seen_candle_open:
+                state = set_symbol_state(state, self.name, sym_state)
+                save_state(state)
+                return
             self.last_seen_candle_open = last_closed.open_time  # nothing actionable this cycle
 
         state = set_symbol_state(state, self.name, sym_state)
