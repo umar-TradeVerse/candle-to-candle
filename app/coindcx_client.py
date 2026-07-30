@@ -503,12 +503,19 @@ class CoinDCXClient:
                      "pnl": pnl, "mark_price": mark_price, "avg_price": avg_price, "raw": entry}
 
         # Call succeeded but coindcx_symbol wasn't found active among the returned
-        # entries. Log exactly what WAS returned — if this keeps happening even with
-        # explicit pagination, this log tells us definitively whether it's still a
-        # pagination/count issue (few entries, real position just isn't among them)
-        # or something else entirely (e.g. a pair-name/field mismatch).
-        seen_pairs = [(e.get("pair"), e.get("active_pos")) for e in entries if isinstance(e, dict)]
-        logger.info(f"{symbol} | No active position found among {len(entries)} returned entries: {seen_pairs}")
+        # entries. Log the FULL raw entry for this specific pair (not just
+        # pair+active_pos) — a live incident showed active_pos=0.0 for BTC while
+        # other pairs (e.g. KAITO) showed real non-zero values and the CoinDCX app
+        # clearly showed an open BTC position, so the issue may be a different field
+        # entirely, not just a matching/pagination problem.
+        matching_raw = [e for e in entries if isinstance(e, dict) and e.get("pair") == coindcx_symbol]
+        if matching_raw:
+            logger.info(f"{symbol} | Found {len(matching_raw)} entry(ies) for {coindcx_symbol} "
+                        f"but none considered active. FULL raw data: {matching_raw}")
+        else:
+            seen_pairs = [(e.get("pair"), e.get("active_pos")) for e in entries if isinstance(e, dict)]
+            logger.info(f"{symbol} | No entry at all for {coindcx_symbol} among {len(entries)} "
+                        f"returned entries: {seen_pairs}")
         return None
 
     async def close_position_market(self, symbol: str, side: str, quantity: float) -> bool:
