@@ -106,10 +106,22 @@ class SymbolWorker:
     async def sync_position_state(self, sym_state):
         """Every cycle, not just startup: if we think a position is open but the
         exchange shows flat, the SL fired (or it was closed some other way) —
-        treat it as a stop-out and alert, instead of trusting stale local state."""
+        treat it as a stop-out and alert, instead of trusting stale local state.
+
+        *** CRITICAL FIX 2026-07-30 *** — get_open_positions() can now return None
+        if the API call itself failed (network blip, timeout). That must NEVER be
+        treated as "confirmed closed" — a real live incident happened where a
+        transient failure caused a still-open position to be wrongly marked closed
+        in our state, meaning it stopped being managed/ratcheted entirely. Only an
+        actual successful response confirming the symbol's absence counts as closed.
+        """
         if not sym_state.get("position_side"):
             return sym_state
         open_positions = await client.get_open_positions()
+        if open_positions is None:
+            logger.warning(f"[{self.name}] could not verify position status this cycle (API call failed) — "
+                           f"leaving state unchanged, will retry next poll")
+            return sym_state
         if self.name not in open_positions:
             logger.info(f"[{self.name}] position closed on exchange (SL fill or external close)")
             sym_state["position_side"] = None
